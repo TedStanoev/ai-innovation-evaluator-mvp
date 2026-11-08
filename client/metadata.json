@@ -1,0 +1,6 @@
+{
+  "name": "AI Team Evaluator",
+  "description": "Academic and competition team evaluation system with dual-agent AI architecture and Human-in-the-Loop oversight.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

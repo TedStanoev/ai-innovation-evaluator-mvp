@@ -1,0 +1,1 @@
+- Follow the project's architecture described in "/plans/project-architecture.md". Do not go out of bounds. If you find any need of doing so, inform the user and let them decide how to continue. 
