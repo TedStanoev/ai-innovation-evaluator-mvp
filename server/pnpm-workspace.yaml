@@ -1,0 +1,8 @@
+onlyBuiltDependencies:
+  - '@firebase/util'
+  - '@google/genai'
+  - better-sqlite3
+  - cpu-features
+  - esbuild
+  - protobufjs
+  - ssh2
