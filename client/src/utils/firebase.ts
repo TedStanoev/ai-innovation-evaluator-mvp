@@ -1,6 +1,25 @@
 import { initializeApp, getApps, FirebaseApp } from "firebase/app";
-import { getFirestore, doc, onSnapshot, Firestore, Unsubscribe } from "firebase/firestore";
-import { CohortEvaluationState } from "../types";
+import {
+  getFirestore,
+  doc,
+  collection,
+  query,
+  where,
+  onSnapshot,
+  Firestore,
+  Unsubscribe,
+} from "firebase/firestore";
+import {
+  AgentThoughtDoc,
+  EvaluationDoc,
+  FullEvaluationSnapshot,
+  ParticipantDoc,
+  QuestionnaireDoc,
+  TeamDoc,
+} from "../types";
+import { fetchEvaluationSnapshot } from "./api";
+
+export const ENABLE_FIREBASE = import.meta.env.VITE_ENABLE_FIREBASE !== "false";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "YOUR_FIREBASE_API_KEY_HERE",
@@ -16,6 +35,7 @@ const firebaseConfig = {
 };
 
 export function isFirebaseConfigured(): boolean {
+  if (!ENABLE_FIREBASE) return false;
   const { apiKey, projectId } = firebaseConfig;
   return (
     Boolean(apiKey) &&
@@ -44,36 +64,128 @@ export function getFirestoreClient(): Firestore | null {
 }
 
 /**
- * Subscribes to a student cohort evaluation document using both Firestore `onSnapshot`
- * (when configured) and fast backend state synchronization so thoughts stream in real time.
+ * Subscribes in real time (`onSnapshot`) to the 5 Firestore collections defined in
+ * `/plans/firestore-database-schema-indexing-plan.md`:
+ * - `evaluations/{evaluationId}`
+ * - `questionnaires` (where `evaluationId == evaluationId`)
+ * - `participants` (where `evaluationId == evaluationId`)
+ * - `teams` (where `evaluationId == evaluationId`)
+ * - `agent_thoughts` (where `evaluationId == evaluationId`)
  */
-export function subscribeToCohortEvaluation(
-  cohortId: string,
-  onUpdate: (data: CohortEvaluationState) => void
+export function subscribeToEvaluationSnapshot(
+  evaluationId: string,
+  onUpdate: (snapshot: Partial<FullEvaluationSnapshot>) => void
 ): Unsubscribe {
   const firestore = getFirestoreClient();
-  let unsubscribeFirestore: Unsubscribe | null = null;
+  const unsubs: Unsubscribe[] = [];
 
   if (firestore) {
     try {
-      const docRef = doc(firestore, "submissions", cohortId);
-      unsubscribeFirestore = onSnapshot(
-        docRef,
-        (snapshot) => {
-          if (snapshot.exists()) {
-            onUpdate(snapshot.data() as CohortEvaluationState);
-          }
-        },
-        (error) => {
-          console.warn(`Firestore onSnapshot warning for ${cohortId}:`, error);
-        }
+      // 1. Master Evaluation document
+      unsubs.push(
+        onSnapshot(
+          doc(firestore, "evaluations", evaluationId),
+          (snap) => {
+            if (snap.exists()) {
+              onUpdate({ evaluation: snap.data() as EvaluationDoc });
+            }
+          },
+          (err) => console.warn("Firestore evaluations onSnapshot error:", err)
+        )
       );
-    } catch {
-      // Continue with backend sync
+
+      // 2. Questionnaires collection
+      unsubs.push(
+        onSnapshot(
+          query(
+            collection(firestore, "questionnaires"),
+            where("evaluationId", "==", evaluationId)
+          ),
+          (snap) => {
+            const questionnaires = snap.docs
+              .map((d) => d.data() as QuestionnaireDoc)
+              .sort((a, b) => a.id.localeCompare(b.id));
+            onUpdate({ questionnaires });
+          },
+          (err) => console.warn("Firestore questionnaires onSnapshot error:", err)
+        )
+      );
+
+      // 3. Participants collection
+      unsubs.push(
+        onSnapshot(
+          query(
+            collection(firestore, "participants"),
+            where("evaluationId", "==", evaluationId)
+          ),
+          (snap) => {
+            const participants = snap.docs
+              .map((d) => d.data() as ParticipantDoc)
+              .sort((a, b) => a.id.localeCompare(b.id));
+            onUpdate({ participants });
+          },
+          (err) => console.warn("Firestore participants onSnapshot error:", err)
+        )
+      );
+
+      // 4. Teams collection
+      unsubs.push(
+        onSnapshot(
+          query(
+            collection(firestore, "teams"),
+            where("evaluationId", "==", evaluationId)
+          ),
+          (snap) => {
+            const teams = snap.docs
+              .map((d) => d.data() as TeamDoc)
+              .sort((a, b) => a.name.localeCompare(b.name));
+            onUpdate({ teams });
+          },
+          (err) => console.warn("Firestore teams onSnapshot error:", err)
+        )
+      );
+
+      // 5. Agent Thoughts stream
+      unsubs.push(
+        onSnapshot(
+          query(
+            collection(firestore, "agent_thoughts"),
+            where("evaluationId", "==", evaluationId)
+          ),
+          (snap) => {
+            const agentThoughts = snap.docs
+              .map((d) => d.data() as AgentThoughtDoc)
+              .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+            onUpdate({ agentThoughts });
+          },
+          (err) => console.warn("Firestore agent_thoughts onSnapshot error:", err)
+        )
+      );
+    } catch (err) {
+      console.warn("Firestore subscription setup warning:", err);
     }
   }
 
+  // Initial snapshot fetch + fallback sync
+  let isCancelled = false;
+  const syncOnce = async () => {
+    if (isCancelled) return;
+    try {
+      const full = await fetchEvaluationSnapshot(evaluationId);
+      if (full && !isCancelled) {
+        onUpdate(full);
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  };
+
+  void syncOnce();
+  const intervalId = setInterval(syncOnce, firestore ? 2000 : 500);
+
   return () => {
-    if (unsubscribeFirestore) unsubscribeFirestore();
+    isCancelled = true;
+    clearInterval(intervalId);
+    for (const u of unsubs) u();
   };
 }

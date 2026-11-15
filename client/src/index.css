@@ -1,1 +1,54 @@
 @import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background-color: #f1f6fc;
+    color: #0b1c30;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+/* Base Plate Glass (plate-acrylic) per /plans/design-context.md */
+.plate-acrylic {
+  background: rgba(255, 255, 255, 0.88);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-top: 1px solid rgba(255, 255, 255, 0.95);
+  border-left: 1px solid rgba(255, 255, 255, 0.95);
+  border-right: 1px solid rgba(186, 230, 253, 0.6);
+  border-bottom: 1px solid rgba(186, 230, 253, 0.6);
+  box-shadow:
+    0 24px 50px -12px rgba(13, 148, 136, 0.16),
+    0 10px 24px -6px rgba(14, 165, 233, 0.13),
+    0 0 0 1px rgba(255, 255, 255, 0.6) inset;
+}
+
+.plate-acrylic-hover {
+  transition:
+    scale 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.plate-acrylic-hover:hover {
+  box-shadow:
+    0 28px 58px -12px rgba(13, 148, 136, 0.25),
+    0 14px 30px -6px rgba(14, 165, 233, 0.2),
+    0 0 0 1px rgba(255, 255, 255, 0.85) inset;
+}
+
+@keyframes teamCardReveal {
+  0% {
+    opacity: 0;
+    translate: 0 14px;
+  }
+  100% {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+.animate-team-card-reveal {
+  animation: teamCardReveal 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}

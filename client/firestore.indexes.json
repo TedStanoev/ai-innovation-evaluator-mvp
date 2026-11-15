@@ -1,0 +1,48 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "participants",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "evaluationId", "order": "ASCENDING" },
+        { "fieldPath": "role.tps", "order": "DESCENDING" },
+        { "fieldPath": "role.indices.MI", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "participants",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "evaluationId", "order": "ASCENDING" },
+        { "fieldPath": "isSelected", "order": "ASCENDING" },
+        { "fieldPath": "role.roleId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "teams",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "evaluationId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "teamBalanceIndex", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "agent_thoughts",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "evaluationId", "order": "ASCENDING" },
+        { "fieldPath": "sequenceNumber", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "questionnaires",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "evaluationId", "order": "ASCENDING" },
+        { "fieldPath": "submittedAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

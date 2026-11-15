@@ -1,1 +1,6 @@
-- Follow the project's architecture described in "/plans/project-architecture.md". Do not go out of bounds. If you find any need of doing so, inform the user and let them decide how to continue. 
+- Follow the project's architecture described in "/plans/project-architecture.md". Do not go out of bounds. If you find any need of doing so, inform the user and let them decide how to continue.
+- The AI agents are described in "/plans/agent-roles.md". Use the file as context for the main features of the AI agents and follow the plan entirely. Do not make decisions to change an AI agent's model, prompt, instruction, etc., unless specifically asked by the user.
+- The firestore database schema is defined in "/plans/firestore-database-schema-indexing-plan.md". Use the document as a context for how the database is defined, what is stored there, indexing and the overall logic
+- Follow the UI layout guide from "/plans/ui-context.md"
+- When creating new components or updating existing ones, do not use styles outside of the defined ones in "/plans/design-context.md", unless specifically asked by the user. Adapt all new components to match the desired typography, colors, borders, shapes, and overall style
+- Let the user know when they ask you to do something that contradicts the descriptions in the plans. If the user confirms the new behavior, go ahead and adapt the plan based on the new requirements.

@@ -10,8 +10,9 @@
     "build": "tsc",
     "lint": "tsc --noEmit",
     "adk:web": "adk web src/agents",
-    "adk:run:auditor": "adk run src/agents/auditorAgent.ts",
-    "adk:run:mentor": "adk run src/agents/mentorAgent.ts"
+    "adk:run:auditor": "adk run src/agents/studentProfilingAgent.ts",
+    "adk:run:mentor": "adk run src/agents/teamFormationAgent.ts",
+    "seed": "tsx src/seed.ts"
   },
   "dependencies": {
     "@google/adk": "^2.4.0",
@@ -19,6 +20,7 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.22.3",
+    "firebase": "^11.4.0",
     "firebase-admin": "^13.1.0",
     "zod": "^3.25.76"
   },

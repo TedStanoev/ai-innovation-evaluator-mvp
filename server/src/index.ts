@@ -2,22 +2,38 @@ import "dotenv/config";
 import express, { Request, Response } from "express";
 import cors from "cors";
 import { InMemoryRunner, isFinalResponse, stringifyContent } from "@google/adk";
-import { auditorAgent } from "./agents/auditorAgent.js";
-import { mentorAgent } from "./agents/mentorAgent.js";
+import { studentProfilingAgent } from "./agents/studentProfilingAgent.js";
+import { teamFormationAgent } from "./agents/teamFormationAgent.js";
 import {
-  appendSubmissionThoughtLog,
-  EvaluatedStudentProfile,
-  FormedTeam,
+  appendAgentThought,
+  clearTeamsForEvaluation,
+  clearThoughtsForEvaluation,
+  createDefaultEvaluationDoc,
+  DEFAULT_EVALUATION_ID,
+  EvaluationDoc,
+  getEvaluationDoc,
   getFirestoreStatus,
-  getSubmissionById,
-  StudentIndices,
-  StudentQuestionnaire,
-  TeamRole,
-  upsertSubmission,
+  getFullEvaluationSnapshot,
+  getParticipantsByEvaluation,
+  getQuestionnairesByEvaluation,
+  getTeamsByEvaluation,
+  ParticipantDoc,
+  ParticipantRoleProfile,
+  QuestionnaireDoc,
+  QuestionnaireSubmissionInput,
+  ROLE_4H_NAMES,
+  Role4HId,
+  saveBatchQuestionnaireSubmissions,
+  saveQuestionnaireSubmission,
+  TeamDoc,
+  TeamMemberSnapshot,
+  upsertEvaluationDoc,
+  upsertParticipantDoc,
+  upsertTeamDoc,
 } from "./firebase.js";
 
 const app = express();
-const PORT = Number(process.env.PORT) || 8080;
+const PORT = Number(process.env.PORT) || 4000;
 
 const configuredOrigins = (process.env.CLIENT_ORIGIN || "")
   .split(",")
@@ -32,7 +48,6 @@ const allowedOrigins = new Set([
   ...configuredOrigins,
 ]);
 
-// CORS exception for local development and Firebase Hosting clients
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -53,7 +68,7 @@ app.use(
   })
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "5mb" }));
 
 function hasValidGeminiApiKey(): boolean {
   const apiKey = process.env.GOOGLE_GENAI_API_KEY || process.env.GEMINI_API_KEY;
@@ -67,7 +82,7 @@ function hasValidGeminiApiKey(): boolean {
 }
 
 async function runAgentPrompt(
-  agent: typeof auditorAgent,
+  agent: typeof studentProfilingAgent,
   prompt: string
 ): Promise<{ text: string; liveModelUsed: boolean }> {
   if (!hasValidGeminiApiKey()) {
@@ -108,7 +123,10 @@ async function runAgentPrompt(
       liveModelUsed: Boolean(finalOutput.trim()),
     };
   } catch (err) {
-    console.warn(`ADK execution fallback for ${agent.name}:`, err instanceof Error ? err.message : err);
+    console.warn(
+      `ADK execution fallback for ${agent.name}:`,
+      err instanceof Error ? err.message : err
+    );
     return {
       text: "",
       liveModelUsed: false,
@@ -118,535 +136,619 @@ async function runAgentPrompt(
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Deterministic scoring helper implementing Agent 1 (Student Profiling Agent) exact point matrix:
- * - AI (Макс 100 т.) = Въпрос 6 (gpa: 70/50/30/0) + Въпрос 7 (competitions: 30/15/0)
- * - EI (Макс 100 т.) = Въпрос 8 (experience: 100/75/50/20)
- * - MI (Макс 100 т.) = Въпрос 9 (motivation: 100/80/50/0)
- * - LAI (Макс 100 т.) = Въпрос 10 (problemSolving: 100/50/0)
- * - LPI (Макс 100 т.) = Въпрос 11 (teamConflict: 100/60/30/0)
- * - ENI (Макс 100 т.) = Въпрос 12 (budget200: 100/90/50/20)
- */
-
-// TODO: Review and refactor everything below
-function calculateStudentIndices(student: StudentQuestionnaire): StudentIndices {
-  // 1. Academic Index (AI) = Въпрос 6 (gpa) + Въпрос 7 (competitions)
-  let gpaScore = 0;
-  if (student.gpa.includes("Отличен")) gpaScore = 70;
-  else if (student.gpa.includes("Много добър")) gpaScore = 50;
-  else if (student.gpa.includes("Добър")) gpaScore = 30;
-  else gpaScore = 0;
-
-  let compScore = 0;
-  if (student.competitions.includes("челни места") || student.competitions.includes("награди")) {
-    compScore = 30;
-  } else if (student.competitions.includes("Да, участвал")) {
-    compScore = 15;
-  } else {
-    compScore = 0;
-  }
-  const AI = Math.min(100, gpaScore + compScore);
-
-  // 2. Experience Index (EI) = Въпрос 8 (experience)
-  let EI = 20;
-  if (student.experience.includes("собствен реален проект") || student.experience.includes("лидер")) {
-    EI = 100;
-  } else if (student.experience.includes("клубове") || student.experience.includes("НПО")) {
-    EI = 75;
-  } else if (student.experience.includes("лично хоби")) {
-    EI = 50;
-  } else if (student.experience.includes("Нямам опит")) {
-    EI = 20;
-  }
-
-  // 3. Motivation Index (MI) = Въпрос 9 (motivation)
-  let MI = 0;
-  if (
-    student.motivation.includes("собствена идея") ||
-    student.motivation.includes("своя идея") ||
-    student.motivation.includes("реален продукт")
-  ) {
-    MI = 100;
-  } else if (student.motivation.includes("практическите си умения")) {
-    MI = 80;
-  } else if (student.motivation.includes("ново предизвикателство")) {
-    MI = 50;
-  } else if (student.motivation.includes("препоръча")) {
-    MI = 0;
-  }
-
-  // 4. Learning Agility Index (LAI) = Въпрос 10 (problemSolving)
-  let LAI = 0;
-  if (student.problemSolving.includes("Веднага започвам") || student.problemSolving.includes("уча в движение")) {
-    LAI = 100;
-  } else if (student.problemSolving.includes("по-опитен")) {
-    LAI = 50;
-  } else if (student.problemSolving.includes("само в сфери")) {
-    LAI = 0;
-  }
-
-  // 5. Leadership Potential Index (LPI) = Въпрос 11 (teamConflict)
-  let LPI = 0;
-  if (student.teamConflict.includes("Вземам нещата в свои ръце")) {
-    LPI = 100;
-  } else if (student.teamConflict.includes("успокоя емоциите")) {
-    LPI = 60;
-  } else if (student.teamConflict.includes("моята част")) {
-    LPI = 30;
-  } else {
-    LPI = 0;
-  }
-
-  // 6. Entrepreneurial Index (ENI) = Въпрос 12 (budget200)
-  let ENI = 20;
-  if (student.budget200.includes("инвестирам") || student.budget200.includes("Инвестирам")) {
-    ENI = 100;
-  } else if (student.budget200.includes("спонсори") || student.budget200.includes("партньори")) {
-    ENI = 90;
-  } else if (student.budget200.includes("строг план")) {
-    ENI = 50;
-  } else if (student.budget200.includes("резерва") || student.budget200.includes("безплатно")) {
-    ENI = 20;
-  }
-
-  return { AI, MI, EI, ENI, LAI, LPI };
-}
-
-function classifySingleSituationalAnswer(answer: string): TeamRole | null {
-  if (
-    answer.includes("[Новатор]") ||
-    answer.includes("генераторът на идеи") ||
-    answer.includes("креативен начин") ||
-    answer.includes("нестандартна линия")
-  ) {
-    return "Новатор";
-  }
-  if (
-    answer.includes("[Аналитик]") ||
-    answer.includes("логикът") ||
-    answer.includes("фатални грешки в данните") ||
-    answer.includes("оптимизира системата")
-  ) {
-    return "Аналитик";
-  }
-  if (
-    answer.includes("[Лидер]") ||
-    answer.includes("комуникаторът") ||
-    answer.includes("опаковаме") ||
-    answer.includes("маркетинговата им стратегия")
-  ) {
-    return "Лидер";
-  }
-  if (
-    answer.includes("[Организатор]") ||
-    answer.includes("двигателят") ||
-    answer.includes("строг екшън план по часове") ||
-    answer.includes("пренаредил смените")
-  ) {
-    return "Организатор";
-  }
-  return null;
-}
+// ============================================================================
+// Deterministic Schema & Algorithmic Calculations (`/plans/firestore-database-schema-indexing-plan.md` & `/plans/agent-roles.md`)
+// ============================================================================
 
 /**
- * Deterministic role detection from Part 4 (Questions 13, 14, 15) with tie-breaker priority:
- * Аналитик -> Организатор -> Лидер -> Новатор
+ * Computes `ParticipantRoleProfile` from a `QuestionnaireDoc`:
+ * - AI = round(((GPA - 3.00) / 3.00) * 100)
+ * - EI = 0->0, 1->25, 2->50, 3->75, >=4->100
+ * - MI, INI, ENI = (RawScore - 1) * 25
+ * - TPS = 0.20 * (AI + EI + INI + ENI + MI)
+ * - 4H Role Resolution: majority vote across q1-q4; tie-breaker aligned with highest indices
  */
-function determineStudentRole(student: StudentQuestionnaire): TeamRole {
-  const votes: Record<TeamRole, number> = {
-    Аналитик: 0,
-    Организатор: 0,
-    Лидер: 0,
-    Новатор: 0,
+export function computeParticipantRoleProfile(
+  questionnaire: QuestionnaireDoc
+): ParticipantRoleProfile {
+  const {
+    gpa,
+    extracurricularCount,
+    motivationScoreRaw,
+    initiativeScoreRaw,
+    entrepreneurialScoreRaw,
+  } = questionnaire.profileMetrics;
+
+  const clampedGpa = Math.max(3.0, Math.min(6.0, Number(gpa) || 3.0));
+  const AI = Math.max(
+    0,
+    Math.min(100, Math.round(((clampedGpa - 3.0) / 3.0) * 100))
+  );
+
+  const count = Math.max(0, Math.round(Number(extracurricularCount) || 0));
+  const EI =
+    count === 0
+      ? 0
+      : count === 1
+      ? 25
+      : count === 2
+      ? 50
+      : count === 3
+      ? 75
+      : 100;
+
+  const clampRaw = (v: number) => Math.max(1, Math.min(5, Math.round(Number(v) || 1)));
+  const MI = (clampRaw(motivationScoreRaw) - 1) * 25;
+  const INI = (clampRaw(initiativeScoreRaw) - 1) * 25;
+  const ENI = (clampRaw(entrepreneurialScoreRaw) - 1) * 25;
+
+  const tps = Number((0.2 * (AI + EI + INI + ENI + MI)).toFixed(1));
+
+  const roleVoteBreakdown: Record<Role4HId, number> = {
+    hacker: 0,
+    hipster: 0,
+    hustler: 0,
+    hound: 0,
   };
 
-  for (const ans of [student.newProjectRole, student.hours48Role, student.storeCaseRole]) {
-    const role = classifySingleSituationalAnswer(ans);
-    if (role) votes[role] += 1;
-  }
+  const answers: Role4HId[] = [
+    questionnaire.roleAssessmentAnswers.q1_teamStrength,
+    questionnaire.roleAssessmentAnswers.q2_deadlineFocus,
+    questionnaire.roleAssessmentAnswers.q3_challengeType,
+    questionnaire.roleAssessmentAnswers.q4_communicationStyle,
+  ];
 
-  const priorityOrder: TeamRole[] = ["Аналитик", "Организатор", "Лидер", "Новатор"];
-  let bestRole: TeamRole = "Аналитик";
-  let maxVotes = -1;
-
-  for (const role of priorityOrder) {
-    if (votes[role] > maxVotes) {
-      maxVotes = votes[role];
-      bestRole = role;
+  for (const ans of answers) {
+    if (ans in roleVoteBreakdown) {
+      roleVoteBreakdown[ans] += 1;
     }
   }
 
-  return bestRole;
-}
-
-/**
- * Parses Agent 1 JSON output ({ Candidate_ID, AI_Score, EI_Score, MI_Score, LAI_Score, LPI_Score, ENI_Score, Dominant_Role })
- * or structured text lines, falling back to deterministic point matrix values.
- */
-function parseIndicesFromAgent1Text(
-  text: string,
-  student: StudentQuestionnaire,
-  fallbackIndices: StudentIndices,
-  fallbackRole: TeamRole
-): { indices: StudentIndices; role: TeamRole } {
-  if (!text) return { indices: fallbackIndices, role: fallbackRole };
-
-  try {
-    const cleaned = text
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/```\s*$/, "")
-      .trim();
-    const parsed = JSON.parse(cleaned);
-    const items = Array.isArray(parsed) ? parsed : [parsed];
-    const matched = items.find(
-      (item: Record<string, unknown>) =>
-        typeof item?.Candidate_ID === "string" &&
-        (item.Candidate_ID.includes(student.id) ||
-          item.Candidate_ID.toLowerCase().includes(student.name.toLowerCase()))
-    );
-    if (matched) {
-      const validRoles: TeamRole[] = ["Новатор", "Аналитик", "Лидер", "Организатор"];
-      const parsedRole = validRoles.includes(matched.Dominant_Role as TeamRole)
-        ? (matched.Dominant_Role as TeamRole)
-        : fallbackRole;
-      return {
-        indices: {
-          AI: typeof matched.AI_Score === "number" ? matched.AI_Score : fallbackIndices.AI,
-          EI: typeof matched.EI_Score === "number" ? matched.EI_Score : fallbackIndices.EI,
-          MI: typeof matched.MI_Score === "number" ? matched.MI_Score : fallbackIndices.MI,
-          LAI: typeof matched.LAI_Score === "number" ? matched.LAI_Score : fallbackIndices.LAI,
-          LPI: typeof matched.LPI_Score === "number" ? matched.LPI_Score : fallbackIndices.LPI,
-          ENI: typeof matched.ENI_Score === "number" ? matched.ENI_Score : fallbackIndices.ENI,
-        },
-        role: parsedRole,
-      };
-    }
-  } catch {
-    // Fall through to line-by-line regex extraction
-  }
-
-  const lines = text.split("\n");
-  const matchingLine = lines.find((l) => l.toLowerCase().includes(student.name.toLowerCase()));
-  if (!matchingLine) return { indices: fallbackIndices, role: fallbackRole };
-
-  const extractNum = (key: string, defaultVal: number): number => {
-    const regex = new RegExp(`${key}(?:_Score)?\\s*[:=]\\s*(\\d+(?:\\.\\d+)?)`, "i");
-    const match = matchingLine.match(regex);
-    if (match && match[1]) {
-      const val = Math.round(Number(match[1]));
-      if (!Number.isNaN(val) && val >= 0 && val <= 100) return val;
-    }
-    return defaultVal;
+  // Semantic alignment scores for tie-breaking (2-2 ties)
+  const semanticAffinity: Record<Role4HId, number> = {
+    hacker: AI + EI,
+    hipster: MI + EI,
+    hustler: ENI + INI,
+    hound: INI + AI,
   };
+
+  const roles: Role4HId[] = ["hacker", "hipster", "hustler", "hound"];
+  roles.sort((a, b) => {
+    if (roleVoteBreakdown[b] !== roleVoteBreakdown[a]) {
+      return roleVoteBreakdown[b] - roleVoteBreakdown[a];
+    }
+    return semanticAffinity[b] - semanticAffinity[a];
+  });
+
+  const winningRoleId = roles[0]!;
 
   return {
+    roleId: winningRoleId,
+    roleName: ROLE_4H_NAMES[winningRoleId],
+    roleVoteBreakdown,
     indices: {
-      AI: extractNum("AI", fallbackIndices.AI),
-      MI: extractNum("MI", fallbackIndices.MI),
-      EI: extractNum("EI", fallbackIndices.EI),
-      ENI: extractNum("ENI", fallbackIndices.ENI),
-      LAI: extractNum("LAI", fallbackIndices.LAI),
-      LPI: extractNum("LPI", fallbackIndices.LPI),
+      AI,
+      EI,
+      INI,
+      ENI,
+      MI,
     },
-    role: fallbackRole,
+    tps,
+  };
+}
+
+function computeTeamMetrics(members: TeamMemberSnapshot[]): {
+  roleBalance: TeamDoc["roleBalance"];
+  averageTPS: number;
+  diversityScore: number;
+  teamBalanceIndex: number;
+  compatibilityPercentage: number;
+} {
+  const counts: Record<Role4HId, number> = {
+    hacker: 0,
+    hipster: 0,
+    hustler: 0,
+    hound: 0,
+  };
+
+  for (const m of members) {
+    counts[m.role.roleId] = (counts[m.role.roleId] || 0) + 1;
+  }
+
+  const isComplete4H =
+    counts.hacker === 1 &&
+    counts.hipster === 1 &&
+    counts.hustler === 1 &&
+    counts.hound === 1;
+
+  const uniqueRoles = Object.values(counts).filter((c) => c > 0).length;
+  const R = isComplete4H ? 100 : Math.round((uniqueRoles / 4) * 100);
+
+  const avgTps =
+    members.length > 0
+      ? Number(
+          (
+            members.reduce((sum, m) => sum + m.role.tps, 0) / members.length
+          ).toFixed(1)
+        )
+      : 0;
+
+  const uniqueCohorts = new Set(
+    members.map((m) => `${m.schoolOrOrganization}::${m.gradeOrPosition}`)
+  ).size;
+  const V =
+    members.length > 0 && uniqueCohorts === members.length
+      ? 100
+      : Math.round((uniqueCohorts / Math.max(1, members.length)) * 100);
+
+  // Per `/plans/agent-roles.md`: TBI_j = (0.70 * avgTPS) + (0.15 * R) + (0.15 * V)
+  const teamBalanceIndex = Number(
+    (0.7 * avgTps + 0.15 * R + 0.15 * V).toFixed(1)
+  );
+
+  // Compatibility percentage (0-100)
+  const compatibilityPercentage = Number(
+    (0.4 * R + 0.4 * avgTps + 0.2 * V).toFixed(1)
+  );
+
+  return {
+    roleBalance: {
+      isComplete4H,
+      hackerCount: counts.hacker,
+      hipsterCount: counts.hipster,
+      hustlerCount: counts.hustler,
+      houndCount: counts.hound,
+    },
+    averageTPS: avgTps,
+    diversityScore: V,
+    teamBalanceIndex,
+    compatibilityPercentage,
   };
 }
 
 /**
- * Background Worker: Executes Agent 1 (Student Profiling Agent) and Agent 2 (Talent Selection & Team Formation Agent),
- * streaming each reasoning thought to Firestore / memory so the client displays every thought live.
+ * Multi-Agent Pipeline Execution:
+ * 1. `student_profiling_agent`: Ingests questionnaires, computes 5 indices + TPS + 4H role, updates `participants/{id}`
+ * 2. Sorts descending by TPS (tie-breaker MI -> INI) and marks Top-K `isSelected: true`
+ * 3. `team_formation_agent`: Assembles 4-member 4H teams with institutional diversity & runs TBI rebalancing swaps
+ * 4. Persists `teams/{id}`, `agent_thoughts/{id}`, and `evaluations/{id}` in Cloud Firestore
  */
-async function executeStudentCohortEvaluationPipeline(
-  submissionId: string,
-  students: StudentQuestionnaire[]
+async function executeEvaluationPipeline(
+  evaluationId: string = DEFAULT_EVALUATION_ID
 ): Promise<void> {
   try {
-    // Thought 1: Agent 1 Initialization
-    await appendSubmissionThoughtLog(
-      submissionId,
-      {
-        agent: "Profiling Agent",
-        step: "Инициализация (Agent 1)",
-        message: `Стартиране на Student Profiling Agent (${auditorAgent.name}) за анализ на ${students.length} ученически формуляра (Въпроси 1–15).`,
-        timestamp: new Date().toISOString(),
-      },
-      { status: "auditing" }
+    await clearThoughtsForEvaluation(evaluationId);
+    await clearTeamsForEvaluation(evaluationId);
+
+    const questionnaires = await getQuestionnairesByEvaluation(evaluationId);
+    const existingParticipants = await getParticipantsByEvaluation(evaluationId);
+    const participantMap = new Map<string, ParticipantDoc>(
+      existingParticipants.map((p) => [p.id, p])
     );
 
-    await delay(400);
+    const evalDoc =
+      (await getEvaluationDoc(evaluationId)) ?? createDefaultEvaluationDoc(evaluationId);
+    const targetCohortSize = evalDoc.config.targetCohortSize || 96;
 
-    // Build structured prompt for Agent 1 (auditorAgent) with explicit Question-to-Field mapping
-    const serializedStudentsForAgent1 = students
-      .map(
-        (s) =>
-          `Candidate_ID: ${s.id} (${s.name})
-ЧАСТ 1 (Основна информация):
-  1. Име и Фамилия (name): ${s.name}
-  2. Възраст (age): ${s.age}
-  3. Училище / Организация (school): ${s.school}
-  4. Клас / Курс (grade): ${s.grade}
-  5. Имейл за връзка (email): ${s.email}
-ЧАСТ 2 (Академичен профил и Опит -> AI и EI):
-  6. Среден успех (gpa -> AI): ${s.gpa}
-  7. Състезания/олимпиади (competitions -> AI): ${s.competitions}
-  8. Извънкласен опит (experience -> EI): ${s.experience}
-ЧАСТ 3 (Мотивация и Потенциал -> MI, LAI, LPI, ENI):
-  9. Основна мотивация (motivation -> MI): ${s.motivation}
-  10. Непозната тема/проблем (problemSolving -> LAI): ${s.problemSolving}
-  11. Сериозен спор в екип (teamConflict -> LPI): ${s.teamConflict}
-  12. Бюджет 200 лв (budget200 -> ENI): ${s.budget200}
-ЧАСТ 4 (Екипен профил -> Доминираща роля):
-  13. Нов групов проект (newProjectRole): ${s.newProjectRole}
-  14. Оставащи 48 часа до крайния срок (hours48Role): ${s.hours48Role}
-  15. Казус в голям магазин (storeCaseRole): ${s.storeCaseRole}`
-      )
-      .join("\n\n---\n\n");
+    await appendAgentThought(
+      evaluationId,
+      {
+        agentName: "student_profiling_agent",
+        phase: "ingestion",
+        message: `Инициализиране на student_profiling_agent (${studentProfilingAgent.model}) за обработка на ${questionnaires.length} подадени въпросника в Firestore.`,
+        metadata: {
+          participantIds: questionnaires.map((q) => q.participantId),
+        },
+      },
+      {
+        status: "profiling_participants",
+        errorMessage: null,
+        teamIds: [],
+        metrics: {
+          ...evalDoc.metrics,
+          totalParticipants: questionnaires.length,
+          profiledParticipants: 0,
+          selectedParticipants: 0,
+          totalTeamsFormed: 0,
+          confirmedTeamsCount: 0,
+        },
+      }
+    );
 
-    await appendSubmissionThoughtLog(submissionId, {
-      agent: "Profiling Agent",
-      step: "Съпоставяне с точковата матрица (Въпроси 6–15)",
-      message:
-        "Съпоставяне на отговорите от Въпроси 6–12 за изчисляване на AI, EI, MI, LAI, LPI, ENI и гласуване от Въпроси 13–15 за Доминираща роля...",
-      timestamp: new Date().toISOString(),
-    });
+    await delay(250);
 
-    // Run Agent 1 via Google ADK
-    const agent1Response = await runAgentPrompt(auditorAgent, serializedStudentsForAgent1);
+    // Optional ADK call for live LLM trace
+    const promptForAgent1 = JSON.stringify(
+      questionnaires.map((q) => ({
+        participantId: q.participantId,
+        generalInfo: q.generalInfo,
+        profileMetrics: q.profileMetrics,
+        roleAssessmentAnswers: q.roleAssessmentAnswers,
+      }))
+    );
+    void runAgentPrompt(studentProfilingAgent, promptForAgent1);
 
-    const evaluatedProfiles: EvaluatedStudentProfile[] = [];
+    // Step 1: Index calculation & 4H role resolution per participant
+    const profiledParticipants: ParticipantDoc[] = [];
 
-    for (const student of students) {
-      await delay(350);
-      const baseIndices = calculateStudentIndices(student);
-      const baseRole = determineStudentRole(student);
-      const { indices, role } = parseIndicesFromAgent1Text(
-        agent1Response.text,
-        student,
-        baseIndices,
-        baseRole
-      );
+    for (let i = 0; i < questionnaires.length; i++) {
+      const q = questionnaires[i]!;
+      await delay(90);
 
-      // TPS = (25% * MI) + (20% * ENI) + (20% * LPI) + (15% * EI) + (10% * AI) + (10% * LAI)
-      const tps = Number(
-        (
-          0.25 * indices.MI +
-          0.2 * indices.ENI +
-          0.2 * indices.LPI +
-          0.15 * indices.EI +
-          0.1 * indices.AI +
-          0.1 * indices.LAI
-        ).toFixed(1)
-      );
+      const roleProfile = computeParticipantRoleProfile(q);
+      const baseParticipant: ParticipantDoc = participantMap.get(q.participantId) ?? {
+        id: q.participantId,
+        evaluationId,
+        fullName: q.generalInfo.fullName,
+        email: `${q.participantId}@innovation.edu`,
+        schoolOrOrganization: q.generalInfo.schoolOrOrganization,
+        gradeOrPosition: q.generalInfo.gradeOrPosition,
+        questionnaireId: q.id,
+        isSelected: false,
+        selectionRank: null,
+        role: null,
+        createdAt: q.submittedAt,
+        updatedAt: new Date().toISOString(),
+      };
 
-      const rawProfileLine = JSON.stringify({
-        Candidate_ID: student.name,
-        AI_Score: indices.AI,
-        EI_Score: indices.EI,
-        MI_Score: indices.MI,
-        LAI_Score: indices.LAI,
-        LPI_Score: indices.LPI,
-        ENI_Score: indices.ENI,
-        Dominant_Role: role,
+      const updatedParticipant = await upsertParticipantDoc({
+        ...baseParticipant,
+        role: roleProfile,
       });
 
-      evaluatedProfiles.push({
-        studentId: student.id,
-        name: student.name,
-        age: student.age,
-        school: student.school,
-        grade: student.grade,
-        email: student.email,
-        indices,
-        tps,
-        role,
-        rawProfileLine,
-      });
+      profiledParticipants.push(updatedParticipant);
 
-      await appendSubmissionThoughtLog(
-        submissionId,
+      await appendAgentThought(
+        evaluationId,
         {
-          agent: "Profiling Agent",
-          step: `Профил: ${student.name}`,
-          message: `JSON Профил за ${student.name} (${student.school}, ${student.grade}) → AI_Score: ${indices.AI} | EI_Score: ${indices.EI} | MI_Score: ${indices.MI} | LAI_Score: ${indices.LAI} | LPI_Score: ${indices.LPI} | ENI_Score: ${indices.ENI} | Dominant_Role: "${role}"`,
-          timestamp: new Date().toISOString(),
+          agentName: "student_profiling_agent",
+          phase: "indexing",
+          message: `Профилиран ${updatedParticipant.fullName} (${updatedParticipant.schoolOrOrganization}, ${updatedParticipant.gradeOrPosition}) → AI:${roleProfile.indices.AI} | EI:${roleProfile.indices.EI} | INI:${roleProfile.indices.INI} | ENI:${roleProfile.indices.ENI} | MI:${roleProfile.indices.MI} ⇒ TPS: ${roleProfile.tps} | 4H Роля: ${roleProfile.roleName} (${roleProfile.roleVoteBreakdown[roleProfile.roleId]}/4 гласа)`,
+          metadata: {
+            participantIds: [updatedParticipant.id],
+          },
         },
         {
-          evaluatedStudents: [...evaluatedProfiles],
+          metrics: {
+            totalParticipants: questionnaires.length,
+            profiledParticipants: profiledParticipants.length,
+            selectedParticipants: 0,
+            totalTeamsFormed: 0,
+            confirmedTeamsCount: 0,
+            averageCohortTPS: Number(
+              (
+                profiledParticipants.reduce(
+                  (acc, p) => acc + (p.role?.tps ?? 0),
+                  0
+                ) / profiledParticipants.length
+              ).toFixed(1)
+            ),
+            currentTbiSpread: 0,
+          },
         }
       );
     }
 
-    const agent1FormattedOutput =
-      agent1Response.text || evaluatedProfiles.map((p) => p.rawProfileLine).join("\n");
+    await delay(250);
 
-    await delay(400);
-
-    await appendSubmissionThoughtLog(
-      submissionId,
-      {
-        agent: "Profiling Agent",
-        step: "Завършено профилиране",
-        message: `Генерирани са 6-те количествени индекса за всички ${evaluatedProfiles.length} ученици. Прехвърляне на профилите към Agent 2 (Talent Selection & Team Formation Agent).`,
-        timestamp: new Date().toISOString(),
-      },
-      {
-        agent1RawOutput: agent1FormattedOutput,
-      }
-    );
-
-    await delay(450);
-
-    // Phase 2: Agent 2 (mentorAgent - Talent Selection & Team Formation)
-    await appendSubmissionThoughtLog(submissionId, {
-      agent: "Team Formation Agent",
-      step: "Калкулация на TPS (Agent 2)",
-      message:
-        "Прилагане на формулата TPS = (25% * MI) + (20% * ENI) + (20% * LPI) + (15% * EI) + (10% * AI) + (10% * LAI) и класиране в низходящ ред...",
-      timestamp: new Date().toISOString(),
+    // Step 2: Descending sort by TPS with MI -> INI tie-breaking & Top-K cutoff
+    const sortedParticipants = [...profiledParticipants].sort((a, b) => {
+      const tpsA = a.role?.tps ?? 0;
+      const tpsB = b.role?.tps ?? 0;
+      if (tpsB !== tpsA) return tpsB - tpsA;
+      const miA = a.role?.indices.MI ?? 0;
+      const miB = b.role?.indices.MI ?? 0;
+      if (miB !== miA) return miB - miA;
+      const iniA = a.role?.indices.INI ?? 0;
+      const iniB = b.role?.indices.INI ?? 0;
+      return iniB - iniA;
     });
 
-    const sortedByTps = [...evaluatedProfiles].sort((a, b) => {
-      if (b.tps !== a.tps) return b.tps - a.tps;
-      if (b.indices.MI !== a.indices.MI) return b.indices.MI - a.indices.MI;
-      if (b.indices.LPI !== a.indices.LPI) return b.indices.LPI - a.indices.LPI;
-      return b.indices.ENI - a.indices.ENI;
-    });
-
-    await delay(400);
-
-    for (const [idx, candidate] of sortedByTps.entries()) {
-      await appendSubmissionThoughtLog(submissionId, {
-        agent: "Team Formation Agent",
-        step: `Класиране #${idx + 1}: ${candidate.name}`,
-        message: `${candidate.name} | Клас: ${candidate.grade} | TPS: ${candidate.tps} т. (MI: ${candidate.indices.MI}, LPI: ${candidate.indices.LPI}, ENI: ${candidate.indices.ENI}) → Доминираща роля от Част 2: [${candidate.role}]`,
-        timestamp: new Date().toISOString(),
+    const rankedParticipants: ParticipantDoc[] = [];
+    for (let idx = 0; idx < sortedParticipants.length; idx++) {
+      const p = sortedParticipants[idx]!;
+      const rank = idx + 1;
+      const isSelected = rank <= targetCohortSize;
+      const saved = await upsertParticipantDoc({
+        ...p,
+        selectionRank: rank,
+        isSelected,
       });
-      await delay(300);
+      rankedParticipants.push(saved);
     }
 
-    // Build prompt for Agent 2 (mentorAgent)
-    const serializedForAgent2 = students
-      .map((s) => {
-        const prof = evaluatedProfiles.find((p) => p.studentId === s.id)!;
-        return `${prof.rawProfileLine} | TPS: ${prof.tps}\nЧаст 2 Казуси: 1) ${s.newProjectRole} | 2) ${s.hours48Role} | 3) ${s.storeCaseRole}`;
-      })
-      .join("\n\n");
-
-    const agent2Response = await runAgentPrompt(mentorAgent, serializedForAgent2);
-
-    await appendSubmissionThoughtLog(submissionId, {
-      agent: "Team Formation Agent",
-      step: "Сглобяване на матрицата на екипите",
-      message:
-        "Проверка на Желязно правило 1 (Баланс на ролите: 1 Лидер, 1 Новатор, 1 Аналитик, 1 Организатор) и Желязно правило 2 (Класово и училищно разнообразие)...",
-      timestamp: new Date().toISOString(),
-    });
-
-    await delay(450);
-
-    // Group evaluated profiles into balanced teams of up to 4
-    const teams: FormedTeam[] = [];
-    const roleOrder: TeamRole[] = ["Лидер", "Новатор", "Аналитик", "Организатор"];
-    const unassigned = [...sortedByTps];
-    let teamCounter = 1;
-
-    while (unassigned.length > 0) {
-      const teamMembers: EvaluatedStudentProfile[] = [];
-
-      for (const targetRole of roleOrder) {
-        const foundIdx = unassigned.findIndex((u) => u.role === targetRole);
-        if (foundIdx !== -1) {
-          teamMembers.push(unassigned.splice(foundIdx, 1)[0]!);
-        }
-      }
-
-      while (teamMembers.length < 4 && unassigned.length > 0) {
-        teamMembers.push(unassigned.shift()!);
-      }
-
-      const uniqueRoles = new Set(teamMembers.map((m) => m.role)).size;
-      const roleBalanceScore = Math.round((uniqueRoles / 4) * 100);
-
-      const avgTps = Number(
-        (
-          teamMembers.reduce((sum, m) => sum + m.tps, 0) / Math.max(1, teamMembers.length)
-        ).toFixed(1)
-      );
-
-      const uniqueGrades = new Set(teamMembers.map((m) => `${m.school}-${m.grade}`)).size;
-      const diversityScore = uniqueGrades === teamMembers.length ? 100 : 50;
-
-      // TBI = 40% (Наличие на всички 4 роли) + 40% (Средноаритметичен TPS) + 20% (Разнообразие)
-      const compatibilityPercent = Number(
-        (0.4 * roleBalanceScore + 0.4 * avgTps + 0.2 * diversityScore).toFixed(1)
-      );
-
-      const teamName = `Екип ${String(teamCounter).padStart(2, "0")}`;
-      teams.push({
-        id: `team-${teamCounter}`,
-        name: teamName,
-        compatibilityPercent,
-        roleBalanceScore,
-        averageTps: avgTps,
-        diversityScore,
-        members: teamMembers,
-        rationale: `Пълен ролеви баланс (${uniqueRoles}/4 роли: Лидер, Новатор, Аналитик, Организатор), ${uniqueGrades} различни класа/училища и среден TPS ${avgTps} т.`,
-      });
-
-      await appendSubmissionThoughtLog(submissionId, {
-        agent: "Team Formation Agent",
-        step: `Сформиран ${teamName}`,
-        message: `${teamName} (Съвместимост TBI: ${compatibilityPercent}%) → 40% Ролеви баланс (${roleBalanceScore}/100) + 40% Среден TPS (${avgTps}) + 20% Разнообразие (${diversityScore}/100). Членове: ${teamMembers
-          .map((m) => `${m.role}: ${m.name}`)
-          .join(", ")}`,
-        timestamp: new Date().toISOString(),
-      });
-
-      teamCounter++;
-    }
-
-    const formattedTeamsText =
-      agent2Response.text ||
-      teams
-        .map(
-          (t) =>
-            `${t.name} (TBI: ${t.compatibilityPercent}%)\n` +
-            t.members.map((m) => `- ${m.role}: ${m.name} | Клас: ${m.grade} | TPS: ${m.tps}`).join("\n")
-        )
-        .join("\n\n");
-
-    const overallCompatibility =
-      teams.length > 0
+    const selectedCohort = rankedParticipants.filter((p) => p.isSelected && p.role !== null);
+    const avgCohortTps =
+      selectedCohort.length > 0
         ? Number(
-            (teams.reduce((sum, t) => sum + t.compatibilityPercent, 0) / teams.length).toFixed(1)
+            (
+              selectedCohort.reduce((acc, p) => acc + (p.role?.tps ?? 0), 0) /
+              selectedCohort.length
+            ).toFixed(1)
           )
         : 0;
 
-    await upsertSubmission(submissionId, {
-      status: "evaluated",
-      totalScore: overallCompatibility,
-      evaluatedStudents: evaluatedProfiles,
-      teams,
-      agent1RawOutput: agent1FormattedOutput,
-      agent2RawOutput: formattedTeamsText,
-    });
+    await appendAgentThought(
+      evaluationId,
+      {
+        agentName: "student_profiling_agent",
+        phase: "selection_cutoff",
+        message: `Класиране по TPS завършено (Tie-breaker: MI → INI). Селектирани ${selectedCohort.length} от ${rankedParticipants.length} кандидати (Top-${targetCohortSize}). Среден TPS на випуска: ${avgCohortTps} т.`,
+        metadata: {
+          participantIds: selectedCohort.map((p) => p.id),
+        },
+      },
+      {
+        status: "forming_teams",
+        metrics: {
+          totalParticipants: rankedParticipants.length,
+          profiledParticipants: rankedParticipants.length,
+          selectedParticipants: selectedCohort.length,
+          totalTeamsFormed: 0,
+          confirmedTeamsCount: 0,
+          averageCohortTPS: avgCohortTps,
+          currentTbiSpread: 0,
+        },
+      }
+    );
+
+    await delay(300);
+
+    // Step 3: Agent 2 (`team_formation_agent`) 4H Role Distribution & Matrix Assembly
+    const roleCounts: Record<Role4HId, number> = {
+      hacker: 0,
+      hipster: 0,
+      hustler: 0,
+      hound: 0,
+    };
+    for (const p of selectedCohort) {
+      if (p.role) roleCounts[p.role.roleId] += 1;
+    }
+
+    await appendAgentThought(
+      evaluationId,
+      {
+        agentName: "team_formation_agent",
+        phase: "role_classification",
+        message: `Стартиране на team_formation_agent. 4H разпределение в селектирания випуск: Hacker (${roleCounts.hacker}), Hipster (${roleCounts.hipster}), Hustler (${roleCounts.hustler}), Hound (${roleCounts.hound}).`,
+      }
+    );
+
+    void runAgentPrompt(
+      teamFormationAgent,
+      JSON.stringify(
+        selectedCohort.map((p) => ({
+          id: p.id,
+          fullName: p.fullName,
+          schoolOrOrganization: p.schoolOrOrganization,
+          gradeOrPosition: p.gradeOrPosition,
+          role: p.role,
+        }))
+      )
+    );
+
+    await delay(250);
+
+    // Build 4-person teams enforcing Constraint 1 (1 Hacker, 1 Hipster, 1 Hustler, 1 Hound)
+    // and Constraint 2 (distinct schoolOrOrganization/gradeOrPosition)
+    const unassigned = [...selectedCohort];
+    const roleOrder: Role4HId[] = ["hacker", "hipster", "hustler", "hound"];
+    const assembledTeams: TeamDoc[] = [];
+    let teamIdx = 1;
+
+    while (unassigned.length > 0) {
+      const picked: ParticipantDoc[] = [];
+      const usedCohorts = new Set<string>();
+
+      for (const targetRole of roleOrder) {
+        // Prefer candidate with matching role AND distinct school/grade cohort
+        let candidateIdx = unassigned.findIndex(
+          (u) =>
+            u.role?.roleId === targetRole &&
+            !usedCohorts.has(`${u.schoolOrOrganization}::${u.gradeOrPosition}`)
+        );
+        if (candidateIdx === -1) {
+          candidateIdx = unassigned.findIndex((u) => u.role?.roleId === targetRole);
+        }
+        if (candidateIdx !== -1) {
+          const chosen = unassigned.splice(candidateIdx, 1)[0]!;
+          picked.push(chosen);
+          usedCohorts.add(`${chosen.schoolOrOrganization}::${chosen.gradeOrPosition}`);
+        }
+      }
+
+      // Fill any remaining slots up to 4
+      while (picked.length < 4 && unassigned.length > 0) {
+        const nextIdx = unassigned.findIndex(
+          (u) => !usedCohorts.has(`${u.schoolOrOrganization}::${u.gradeOrPosition}`)
+        );
+        const chosen =
+          nextIdx !== -1
+            ? unassigned.splice(nextIdx, 1)[0]!
+            : unassigned.shift()!;
+        picked.push(chosen);
+        usedCohorts.add(`${chosen.schoolOrOrganization}::${chosen.gradeOrPosition}`);
+      }
+
+      const members: TeamMemberSnapshot[] = picked.map((p) => ({
+        participantId: p.id,
+        fullName: p.fullName,
+        email: p.email,
+        schoolOrOrganization: p.schoolOrOrganization,
+        gradeOrPosition: p.gradeOrPosition,
+        questionnaireId: p.questionnaireId,
+        role: p.role!,
+      }));
+
+      const metrics = computeTeamMetrics(members);
+      const teamId = `${evaluationId}-team-${String(teamIdx).padStart(2, "0")}`;
+      const teamName = `Отбор ${String(teamIdx).padStart(2, "0")}`;
+
+      const teamDoc: TeamDoc = {
+        id: teamId,
+        evaluationId,
+        name: teamName,
+        status: "unconfirmed",
+        compatibilityPercentage: metrics.compatibilityPercentage,
+        roleBalance: metrics.roleBalance,
+        averageTPS: metrics.averageTPS,
+        diversityScore: metrics.diversityScore,
+        teamBalanceIndex: metrics.teamBalanceIndex,
+        formationExplanation: `4H баланс (${
+          metrics.roleBalance.isComplete4H ? "Пълен 4/4: Hacker, Hipster, Hustler, Hound" : "Частичен"
+        }), институционално разнообразие ${metrics.diversityScore}% и среден TPS ${metrics.averageTPS} т. (TBI: ${metrics.teamBalanceIndex}).`,
+        members,
+        confirmedBy: null,
+        confirmedAt: null,
+        createdAt: new Date().toISOString(),
+      };
+
+      assembledTeams.push(teamDoc);
+      teamIdx++;
+    }
+
+    await appendAgentThought(
+      evaluationId,
+      {
+        agentName: "team_formation_agent",
+        phase: "matrix_assembly",
+        message: `Сглобена първоначална матрица от ${assembledTeams.length} екипа по 4 участници със спазване на 4H ролеви баланс и институционално разнообразие.`,
+        metadata: {
+          teamIds: assembledTeams.map((t) => t.id),
+        },
+      }
+    );
+
+    await delay(250);
+
+    // Step 4: Self-Healing Rebalancing Algorithm (Swap Loop for ΔTBI <= 15.0)
+    const getSpread = (list: TeamDoc[]) => {
+      if (list.length <= 1) return 0;
+      const tbis = list.map((t) => t.teamBalanceIndex);
+      return Number((Math.max(...tbis) - Math.min(...tbis)).toFixed(1));
+    };
+
+    let currentSpread = getSpread(assembledTeams);
+    const maxSpread = evalDoc.config.maxTbiSpread || 15.0;
+    let iteration = 0;
+
+    while (currentSpread > maxSpread && iteration < 25 && assembledTeams.length > 1) {
+      iteration++;
+      const sortedTeams = [...assembledTeams].sort(
+        (a, b) => b.teamBalanceIndex - a.teamBalanceIndex
+      );
+      const maxTeam = sortedTeams[0]!;
+      const minTeam = sortedTeams[sortedTeams.length - 1]!;
+      const deltaBefore = currentSpread;
+
+      let swapped = false;
+      for (let i = 0; i < maxTeam.members.length; i++) {
+        const u = maxTeam.members[i]!;
+        const j = minTeam.members.findIndex(
+          (v) => v.role.roleId === u.role.roleId && u.role.tps > v.role.tps
+        );
+        if (j !== -1) {
+          const v = minTeam.members[j]!;
+          maxTeam.members[i] = v;
+          minTeam.members[j] = u;
+
+          Object.assign(maxTeam, computeTeamMetrics(maxTeam.members));
+          Object.assign(minTeam, computeTeamMetrics(minTeam.members));
+          currentSpread = getSpread(assembledTeams);
+          swapped = true;
+
+          await appendAgentThought(
+            evaluationId,
+            {
+              agentName: "team_formation_agent",
+              phase: "tbi_swap",
+              message: `TBI Rebalancing Swap #${iteration}: Размяна на [${u.role.roleName}] ${u.fullName} (${maxTeam.name}) ↔ ${v.fullName} (${minTeam.name}). ΔTBI намален от ${deltaBefore} на ${currentSpread}.`,
+              metadata: {
+                participantIds: [u.participantId, v.participantId],
+                teamIds: [maxTeam.id, minTeam.id],
+                tbiDeltaBefore: deltaBefore,
+                tbiDeltaAfter: currentSpread,
+              },
+            }
+          );
+          break;
+        }
+      }
+
+      if (!swapped) break;
+    }
+
+    // Persist all formed teams to Firestore `teams/{teamId}`
+    for (const team of assembledTeams) {
+      await delay(200);
+      team.formationExplanation = `4H Синергия (${team.members
+        .map((m) => `${m.role.roleName}: ${m.fullName}`)
+        .join(" • ")}) | TBI: ${team.teamBalanceIndex} | Съвместимост: ${team.compatibilityPercentage}% | Разнообразие: ${team.diversityScore}%.`;
+      await upsertTeamDoc(team);
+
+      await appendAgentThought(
+        evaluationId,
+        {
+          agentName: "team_formation_agent",
+          phase: "matrix_assembly",
+          message: `Записан в Firestore ${team.name} (TBI: ${team.teamBalanceIndex}, Съвместимост: ${team.compatibilityPercentage}%) → ${team.members
+            .map((m) => `${m.role.roleName}: ${m.fullName} (${m.role.tps})`)
+            .join(", ")}`,
+          metadata: {
+            teamIds: [team.id],
+            participantIds: team.members.map((m) => m.participantId),
+          },
+        }
+      );
+    }
+
+    const finalSpread = getSpread(assembledTeams);
+
+    await appendAgentThought(
+      evaluationId,
+      {
+        agentName: "system",
+        phase: "completed",
+        message: `Двуфазният AI процес завърши успешно. Сформирани ${assembledTeams.length} балансирани 4H екипа (ΔTBI = ${finalSpread} <= ${maxSpread}). Очаква се потвърждение от администратор (awaiting_confirmation).`,
+        metadata: {
+          teamIds: assembledTeams.map((t) => t.id),
+        },
+      },
+      {
+        status: "awaiting_confirmation",
+        teamIds: assembledTeams.map((t) => t.id),
+        metrics: {
+          totalParticipants: rankedParticipants.length,
+          profiledParticipants: rankedParticipants.length,
+          selectedParticipants: selectedCohort.length,
+          totalTeamsFormed: assembledTeams.length,
+          confirmedTeamsCount: assembledTeams.filter((t) => t.status === "confirmed").length,
+          averageCohortTPS: avgCohortTps,
+          currentTbiSpread: finalSpread,
+        },
+      }
+    );
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : "Unknown pipeline error";
-    await appendSubmissionThoughtLog(
-      submissionId,
+    await appendAgentThought(
+      evaluationId,
       {
-        agent: "Team Formation Agent",
-        step: "Грешка в процеса",
-        message: `Възникна грешка при анализа: ${errMsg}`,
-        timestamp: new Date().toISOString(),
+        agentName: "system",
+        phase: "completed",
+        message: `Грешка в AI пайплайна: ${errMsg}`,
       },
-      { status: "needs_review" }
+      {
+        status: "error",
+        errorMessage: errMsg,
+      }
     );
   }
 }
 
-// Health check endpoint
+// ============================================================================
+// REST API Endpoints
+// ============================================================================
+
 app.get("/api/health", (_req: Request, res: Response) => {
   const firestoreStatus = getFirestoreStatus();
   res.json({
@@ -657,80 +759,338 @@ app.get("/api/health", (_req: Request, res: Response) => {
     geminiConfigured: hasValidGeminiApiKey(),
     agents: [
       {
-        name: auditorAgent.name,
-        role: "Student Profiling Agent",
-        model: auditorAgent.model,
-        description: auditorAgent.description,
+        name: studentProfilingAgent.name,
+        role: "Student Profiling & Selection Agent",
+        model: studentProfilingAgent.model,
+        description: studentProfilingAgent.description,
       },
       {
-        name: mentorAgent.name,
-        role: "Talent Selection & Team Formation Agent",
-        model: mentorAgent.model,
-        description: mentorAgent.description,
+        name: teamFormationAgent.name,
+        role: "Team Formation & Quality Control Agent",
+        model: teamFormationAgent.model,
+        description: teamFormationAgent.description,
       },
     ],
   });
 });
 
-// Get single cohort evaluation state
-app.get("/api/submissions/:id", async (req: Request, res: Response) => {
-  const submission = await getSubmissionById(req.params.id);
-  if (!submission) {
-    res.status(404).json({ error: `Submission '${req.params.id}' not found` });
-    return;
+/**
+ * POST /api/questionnaires
+ * Receives a single questionnaire form submission OR a batch `{ evaluationId, questionnaires: [...] }` payload,
+ * validates & transforms it into `QuestionnaireDoc` and `ParticipantDoc` (`role: null`),
+ * and persists the documents to Cloud Firestore (`questionnaires`, `participants`, `evaluations`).
+ */
+app.post("/api/questionnaires", async (req: Request, res: Response) => {
+  try {
+    const body = req.body;
+
+    // Support batch submission `{ questionnaires: [...], evaluationId?: string }` or array `[...]`
+    if (Array.isArray(body) || Array.isArray(body?.questionnaires)) {
+      const items: QuestionnaireSubmissionInput[] = Array.isArray(body)
+        ? body
+        : body.questionnaires;
+      const evaluationId: string = body?.evaluationId || DEFAULT_EVALUATION_ID;
+
+      if (items.length === 0) {
+        res.status(400).json({ error: "No questionnaire submissions provided in batch." });
+        return;
+      }
+
+      for (const item of items) {
+        if (
+          !item?.generalInfo?.fullName ||
+          !item?.profileMetrics ||
+          !item?.roleAssessmentAnswers
+        ) {
+          res.status(400).json({
+            error:
+              "Invalid questionnaire item: generalInfo.fullName, profileMetrics, and roleAssessmentAnswers are required.",
+          });
+          return;
+        }
+      }
+
+      const result = await saveBatchQuestionnaireSubmissions(items, evaluationId);
+      res.status(201).json({
+        ok: true,
+        count: result.questionnaires.length,
+        evaluationId,
+        questionnaires: result.questionnaires,
+        participants: result.participants,
+        evaluation: result.evaluation,
+      });
+      return;
+    }
+
+    // Single questionnaire submission
+    const submission = body as QuestionnaireSubmissionInput;
+    if (
+      !submission?.generalInfo?.fullName ||
+      !submission?.profileMetrics ||
+      !submission?.roleAssessmentAnswers
+    ) {
+      res.status(400).json({
+        error:
+          "Invalid questionnaire submission: generalInfo.fullName, profileMetrics, and roleAssessmentAnswers are required.",
+      });
+      return;
+    }
+
+    const result = await saveQuestionnaireSubmission(submission);
+    res.status(201).json({
+      ok: true,
+      questionnaire: result.questionnaire,
+      participant: result.participant,
+      evaluation: result.evaluation,
+    });
+  } catch (err) {
+    console.error("Error saving questionnaire submission:", err);
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to save questionnaire submission",
+    });
   }
-  res.json(submission);
+});
+
+/**
+ * GET /api/evaluations/:id
+ * Returns the full evaluation snapshot (`evaluation`, `questionnaires`, `participants`, `teams`, `agentThoughts`)
+ */
+app.get("/api/evaluations/:id", async (req: Request, res: Response) => {
+  const evaluationId = req.params.id || DEFAULT_EVALUATION_ID;
+  const snapshot = await getFullEvaluationSnapshot(evaluationId);
+  res.json(snapshot);
+});
+
+// Alias for legacy route `/api/submissions/:id`
+app.get("/api/submissions/:id", async (req: Request, res: Response) => {
+  const evaluationId = req.params.id || DEFAULT_EVALUATION_ID;
+  const snapshot = await getFullEvaluationSnapshot(evaluationId);
+  res.json(snapshot);
 });
 
 /**
  * POST /api/evaluations/start
- * Fire-and-Forget trigger: sets state to analyzing, dispatches background worker,
- * and immediately returns HTTP 202 Accepted { ok: true }.
+ * Fire-and-Forget trigger: optionally ingests any new questionnaires passed in body,
+ * transitions evaluation to `profiling_participants`, dispatches background ADK pipeline,
+ * and returns HTTP 202 Accepted immediately.
  */
 app.post("/api/evaluations/start", async (req: Request, res: Response) => {
-  const { submissionId, students } = req.body as {
+  const { evaluationId, submissionId, questionnaires } = req.body as {
+    evaluationId?: string;
     submissionId?: string;
-    students?: StudentQuestionnaire[];
+    questionnaires?: QuestionnaireSubmissionInput[];
   };
 
-  const targetId = submissionId || "student-cohort-2026";
-  const studentList = students || [];
+  const targetEvaluationId = evaluationId || submissionId || DEFAULT_EVALUATION_ID;
 
-  await upsertSubmission(targetId, {
-    id: targetId,
-    title: "Ученически Въпросници и Формиране на Екипи",
-    status: "analyzing",
-    students: studentList,
-    evaluatedStudents: [],
-    teams: [],
-    thoughtLogs: [
-      {
-        agent: "Profiling Agent",
-        step: "Заявка приета (HTTP 202)",
-        message: `Заявката за анализ на ${studentList.length} ученици е приета. Инициализиране на AI агентите...`,
-        timestamp: new Date().toISOString(),
-      },
-    ],
+  if (Array.isArray(questionnaires) && questionnaires.length > 0) {
+    await saveBatchQuestionnaireSubmissions(questionnaires, targetEvaluationId);
+  }
+
+  await upsertEvaluationDoc(targetEvaluationId, {
+    status: "profiling_participants",
+    errorMessage: null,
   });
 
-  // Immediately return HTTP 202 Accepted (~5ms)
   res.status(202).json({
     ok: true,
-    submissionId: targetId,
-    status: "analyzing",
+    evaluationId: targetEvaluationId,
+    status: "profiling_participants",
   });
 
-  // Fire-and-forget asynchronous background execution
   setImmediate(() => {
-    executeStudentCohortEvaluationPipeline(targetId, studentList).catch((err) => {
-      console.error(`Background evaluation failed for ${targetId}:`, err);
+    executeEvaluationPipeline(targetEvaluationId).catch((err) => {
+      console.error(`Background evaluation failed for ${targetEvaluationId}:`, err);
     });
   });
+});
+
+/**
+ * POST /api/teams/:teamId/confirm
+ * Human-in-the-Loop confirmation action for a formed team (`status: 'confirmed'`)
+ */
+app.post("/api/teams/:teamId/confirm", async (req: Request, res: Response) => {
+  const { teamId } = req.params;
+  const { evaluationId = DEFAULT_EVALUATION_ID, confirmedBy = "usr-admin-01" } = req.body as {
+    evaluationId?: string;
+    confirmedBy?: string;
+  };
+
+  const teams = await getTeamsByEvaluation(evaluationId);
+  const target = teams.find((t) => t.id === teamId);
+  if (!target) {
+    res.status(404).json({ error: `Team '${teamId}' not found` });
+    return;
+  }
+
+  const updatedTeam = await upsertTeamDoc({
+    ...target,
+    status: "confirmed",
+    confirmedBy,
+    confirmedAt: new Date().toISOString(),
+  });
+
+  const allTeams = await getTeamsByEvaluation(evaluationId);
+  const confirmedCount = allTeams.filter((t) => t.status === "confirmed").length;
+  const evalDoc =
+    (await getEvaluationDoc(evaluationId)) ?? createDefaultEvaluationDoc(evaluationId);
+
+  const allConfirmed = allTeams.length > 0 && confirmedCount === allTeams.length;
+  const updatedEval: EvaluationDoc = await upsertEvaluationDoc(evaluationId, {
+    status: allConfirmed ? "completed" : evalDoc.status,
+    metrics: {
+      ...evalDoc.metrics,
+      confirmedTeamsCount: confirmedCount,
+    },
+  });
+
+  res.json({
+    ok: true,
+    team: updatedTeam,
+    evaluation: updatedEval,
+  });
+});
+
+/**
+ * POST /api/teams/swap
+ * Swaps two participants with the same 4H role between two teams (or with a reserve participant),
+ * recalculating averageTPS, diversityScore, compatibilityPercentage, and teamBalanceIndex.
+ */
+app.post("/api/teams/swap", async (req: Request, res: Response) => {
+  try {
+    const {
+      evaluationId = DEFAULT_EVALUATION_ID,
+      sourceTeamId,
+      sourceParticipantId,
+      targetParticipantId,
+    } = req.body as {
+      evaluationId?: string;
+      sourceTeamId: string;
+      sourceParticipantId: string;
+      targetParticipantId: string;
+    };
+
+    if (!sourceTeamId || !sourceParticipantId || !targetParticipantId) {
+      res.status(400).json({
+        error: "sourceTeamId, sourceParticipantId, and targetParticipantId are required.",
+      });
+      return;
+    }
+
+    const teams = await getTeamsByEvaluation(evaluationId);
+    const participants = await getParticipantsByEvaluation(evaluationId);
+
+    const sourceTeam = teams.find((t) => t.id === sourceTeamId);
+    if (!sourceTeam) {
+      res.status(404).json({ error: `Source team '${sourceTeamId}' not found.` });
+      return;
+    }
+
+    const sourceIdx = sourceTeam.members.findIndex(
+      (m) => m.participantId === sourceParticipantId
+    );
+    if (sourceIdx === -1) {
+      res.status(404).json({
+        error: `Participant '${sourceParticipantId}' not found in team '${sourceTeamId}'.`,
+      });
+      return;
+    }
+
+    const sourceMember = sourceTeam.members[sourceIdx]!;
+    const targetTeam = teams.find((t) =>
+      t.members.some((m) => m.participantId === targetParticipantId)
+    );
+
+    if (targetTeam) {
+      const targetIdx = targetTeam.members.findIndex(
+        (m) => m.participantId === targetParticipantId
+      );
+      const targetMember = targetTeam.members[targetIdx]!;
+
+      sourceTeam.members[sourceIdx] = targetMember;
+      targetTeam.members[targetIdx] = sourceMember;
+
+      const sourceMetrics = computeTeamMetrics(sourceTeam.members);
+      Object.assign(sourceTeam, sourceMetrics, {
+        formationExplanation: `4H Синергия (${sourceTeam.members
+          .map((m) => `${m.role.roleName}: ${m.fullName}`)
+          .join(" • ")}) | TBI: ${sourceMetrics.teamBalanceIndex} | Съвместимост: ${sourceMetrics.compatibilityPercentage}% | Разнообразие: ${sourceMetrics.diversityScore}%.`,
+      });
+
+      const targetMetrics = computeTeamMetrics(targetTeam.members);
+      Object.assign(targetTeam, targetMetrics, {
+        formationExplanation: `4H Синергия (${targetTeam.members
+          .map((m) => `${m.role.roleName}: ${m.fullName}`)
+          .join(" • ")}) | TBI: ${targetMetrics.teamBalanceIndex} | Съвместимост: ${targetMetrics.compatibilityPercentage}% | Разнообразие: ${targetMetrics.diversityScore}%.`,
+      });
+
+      await Promise.all([upsertTeamDoc(sourceTeam), upsertTeamDoc(targetTeam)]);
+    } else {
+      // Target is an unassigned / reserve participant
+      const reserveDoc = participants.find((p) => p.id === targetParticipantId);
+      if (!reserveDoc || !reserveDoc.role) {
+        res.status(404).json({
+          error: `Target participant '${targetParticipantId}' not found or not profiled.`,
+        });
+        return;
+      }
+
+      const reserveSnapshot: TeamMemberSnapshot = {
+        participantId: reserveDoc.id,
+        fullName: reserveDoc.fullName,
+        email: reserveDoc.email,
+        schoolOrOrganization: reserveDoc.schoolOrOrganization,
+        gradeOrPosition: reserveDoc.gradeOrPosition,
+        questionnaireId: reserveDoc.questionnaireId,
+        role: reserveDoc.role,
+      };
+
+      sourceTeam.members[sourceIdx] = reserveSnapshot;
+      const sourceMetrics = computeTeamMetrics(sourceTeam.members);
+      Object.assign(sourceTeam, sourceMetrics, {
+        formationExplanation: `4H Синергия (${sourceTeam.members
+          .map((m) => `${m.role.roleName}: ${m.fullName}`)
+          .join(" • ")}) | TBI: ${sourceMetrics.teamBalanceIndex} | Съвместимост: ${sourceMetrics.compatibilityPercentage}% | Разнообразие: ${sourceMetrics.diversityScore}%.`,
+      });
+
+      await upsertTeamDoc(sourceTeam);
+    }
+
+    const updatedTeams = await getTeamsByEvaluation(evaluationId);
+    const tbis = updatedTeams.map((t) => t.teamBalanceIndex);
+    const currentTbiSpread =
+      tbis.length > 1
+        ? Number((Math.max(...tbis) - Math.min(...tbis)).toFixed(1))
+        : 0;
+
+    const evalDoc =
+      (await getEvaluationDoc(evaluationId)) ?? createDefaultEvaluationDoc(evaluationId);
+    const updatedEval = await upsertEvaluationDoc(evaluationId, {
+      metrics: {
+        ...evalDoc.metrics,
+        currentTbiSpread,
+      },
+    });
+
+    res.json({
+      ok: true,
+      teams: updatedTeams,
+      evaluation: updatedEval,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to swap team members",
+    });
+  }
 });
 
 app.listen(PORT, () => {
   const dbStatus = getFirestoreStatus();
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Database mode: ${dbStatus.mode}`);
-  console.log(`Registered ADK Agents: ${auditorAgent.name}, ${mentorAgent.name}`);
+  console.log(
+    `Database mode: ${dbStatus.mode} (driver: ${dbStatus.driver}, project: ${dbStatus.projectId})`
+  );
+  console.log(
+    `Registered ADK Agents: ${studentProfilingAgent.name}, ${teamFormationAgent.name}`
+  );
 });
