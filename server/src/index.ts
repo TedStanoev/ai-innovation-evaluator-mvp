@@ -1,8 +1,12 @@
-import "dotenv/config";
 import express, { Request, Response } from "express";
 import cors from "cors";
 import { InMemoryRunner, isFinalResponse, stringifyContent } from "@google/adk";
-import { studentProfilingAgent } from "./agents/studentProfilingAgent.js";
+import { serverEnv } from "./env.js";
+import {
+  Agent1EvaluatedCandidate,
+  Agent1ProfilingOutput,
+  studentProfilingAgent,
+} from "./agents/studentProfilingAgent.js";
 import { teamFormationAgent } from "./agents/teamFormationAgent.js";
 import {
   appendAgentThought,
@@ -33,20 +37,14 @@ import {
 } from "./firebase.js";
 
 const app = express();
-const PORT = Number(process.env.PORT) || 4000;
+const PORT = serverEnv.PORT;
 
-const configuredOrigins = (process.env.CLIENT_ORIGIN || "")
+const configuredOrigins = serverEnv.CLIENT_ORIGIN
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
 
-const allowedOrigins = new Set([
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  ...configuredOrigins,
-]);
+const allowedOrigins = new Set(configuredOrigins);
 
 app.use(
   cors({
@@ -71,14 +69,7 @@ app.use(
 app.use(express.json({ limit: "5mb" }));
 
 function hasValidGeminiApiKey(): boolean {
-  const apiKey = process.env.GOOGLE_GENAI_API_KEY || process.env.GEMINI_API_KEY;
-  if (!apiKey) return false;
-  return (
-    apiKey !== "YOUR_KEY_HERE" &&
-    apiKey !== "MY_GEMINI_API_KEY" &&
-    apiKey !== "your_gemini_api_key_here" &&
-    !apiKey.startsWith("YOUR_")
-  );
+  return Boolean(serverEnv.GOOGLE_GENAI_API_KEY || serverEnv.GEMINI_API_KEY);
 }
 
 async function runAgentPrompt(
@@ -90,10 +81,6 @@ async function runAgentPrompt(
       text: "",
       liveModelUsed: false,
     };
-  }
-
-  if (!process.env.GOOGLE_GENAI_API_KEY && process.env.GEMINI_API_KEY) {
-    process.env.GOOGLE_GENAI_API_KEY = process.env.GEMINI_API_KEY;
   }
 
   try {
@@ -140,16 +127,86 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // Deterministic Schema & Algorithmic Calculations (`/plans/firestore-database-schema-indexing-plan.md` & `/plans/agent-roles.md`)
 // ============================================================================
 
+export const SITUATIONAL_QUESTION_RAW_TEXTS: {
+  q1_teamStrength: Record<Role4HId, string>;
+  q2_deadlineFocus: Record<Role4HId, string>;
+  q3_challengeType: Record<Role4HId, string>;
+  q4_communicationStyle: Record<Role4HId, string>;
+} = {
+  q1_teamStrength: {
+    hacker:
+      "Изграждането на самото решение – логика, програмиране, технически детайли.",
+    hipster:
+      "Оформянето на концепцията – дизайн, визуална идентичност и преживяване на потребителя.",
+    hustler:
+      "Продаването на идеята – водене на преговори, бизнес стратегия и презентиране пред публика.",
+    hound:
+      "Структурирането на процеса – планиране на задачите, сроковете и координация на хората.",
+  },
+  q2_deadlineFocus: {
+    hacker:
+      "Тестване на функционалността и изчистване на последните технически грешки/бъгове.",
+    hipster:
+      "Изглаждане на цветовете, шрифтовете и цялостния дизайн на финалната презентация.",
+    hustler:
+      "Репетиране на речта (питча) и изчистване на ключовите послания, с които ще спечелите журито.",
+    hound:
+      "Финална проверка дали всички изисквания по регламент са спазени и събиране на файловете.",
+  },
+  q3_challengeType: {
+    hacker:
+      "Да реша сложен логически или технически проблем, който другите смятат за невъзможен.",
+    hipster:
+      "Да създам нещо естетически красиво, което предизвиква емоция в хората.",
+    hustler:
+      "Да намеря реален клиент, да продам продукта и да генерирам приходи.",
+    hound:
+      "Да организирам хаоса в подредена система, която работи като швейцарски часовник.",
+  },
+  q4_communicationStyle: {
+    hacker: "Говоря в факти, данни и конкретни логически стъпки.",
+    hipster:
+      "Използвам метафори, визуални примери и фокус върху креативността.",
+    hustler: "Говоря уверено, убедително и директно към ползите и резултатите.",
+    hound:
+      "Задавам уточняващи въпроси, за да съм сигурен, че всички са разбрали правилата и сроковете.",
+  },
+};
+
+export function extractSituationalAnswers(questionnaire: QuestionnaireDoc): Agent1EvaluatedCandidate["situationalAnswers"] {
+  const { q1_teamStrength, q2_deadlineFocus, q3_challengeType, q4_communicationStyle } =
+    questionnaire.roleAssessmentAnswers;
+  return {
+    q1_teamStrength: {
+      roleTag: q1_teamStrength,
+      rawText: SITUATIONAL_QUESTION_RAW_TEXTS.q1_teamStrength[q1_teamStrength],
+    },
+    q2_deadlineFocus: {
+      roleTag: q2_deadlineFocus,
+      rawText: SITUATIONAL_QUESTION_RAW_TEXTS.q2_deadlineFocus[q2_deadlineFocus],
+    },
+    q3_challengeType: {
+      roleTag: q3_challengeType,
+      rawText: SITUATIONAL_QUESTION_RAW_TEXTS.q3_challengeType[q3_challengeType],
+    },
+    q4_communicationStyle: {
+      roleTag: q4_communicationStyle,
+      rawText:
+        SITUATIONAL_QUESTION_RAW_TEXTS.q4_communicationStyle[q4_communicationStyle],
+    },
+  };
+}
+
 /**
- * Computes `ParticipantRoleProfile` from a `QuestionnaireDoc`:
- * - AI = round(((GPA - 3.00) / 3.00) * 100)
+ * Computes `ParticipantRoleProfile` from a `QuestionnaireDoc` per Agent 1 (`student_profiling_agent`) formulas:
+ * - AI = ((GPA - 3) / 3) * 100 (GPA strictly between 3.00 and 6.00)
  * - EI = 0->0, 1->25, 2->50, 3->75, >=4->100
  * - MI, INI, ENI = (RawScore - 1) * 25
- * - TPS = 0.20 * (AI + EI + INI + ENI + MI)
- * - 4H Role Resolution: majority vote across q1-q4; tie-breaker aligned with highest indices
+ * - TPS = (0.20 * AI) + (0.20 * EI) + (0.20 * INI) + (0.20 * ENI) + (0.20 * MI)
  */
 export function computeParticipantRoleProfile(
-  questionnaire: QuestionnaireDoc
+  questionnaire: QuestionnaireDoc,
+  currentPoolRoleCounts?: Record<Role4HId, number>
 ): ParticipantRoleProfile {
   const {
     gpa,
@@ -182,7 +239,9 @@ export function computeParticipantRoleProfile(
   const INI = (clampRaw(initiativeScoreRaw) - 1) * 25;
   const ENI = (clampRaw(entrepreneurialScoreRaw) - 1) * 25;
 
-  const tps = Number((0.2 * (AI + EI + INI + ENI + MI)).toFixed(1));
+  const tps = Number(
+    (0.2 * AI + 0.2 * EI + 0.2 * INI + 0.2 * ENI + 0.2 * MI).toFixed(1)
+  );
 
   const roleVoteBreakdown: Record<Role4HId, number> = {
     hacker: 0,
@@ -204,12 +263,12 @@ export function computeParticipantRoleProfile(
     }
   }
 
-  // Semantic alignment scores for tie-breaking (2-2 ties)
-  const semanticAffinity: Record<Role4HId, number> = {
-    hacker: AI + EI,
-    hipster: MI + EI,
-    hustler: ENI + INI,
-    hound: INI + AI,
+  // Tie-breaker per Agent 2 Step 1: assign the tied role with the greatest shortage in the current candidate pool
+  const poolCounts: Record<Role4HId, number> = currentPoolRoleCounts ?? {
+    hacker: 0,
+    hipster: 0,
+    hustler: 0,
+    hound: 0,
   };
 
   const roles: Role4HId[] = ["hacker", "hipster", "hustler", "hound"];
@@ -217,7 +276,7 @@ export function computeParticipantRoleProfile(
     if (roleVoteBreakdown[b] !== roleVoteBreakdown[a]) {
       return roleVoteBreakdown[b] - roleVoteBreakdown[a];
     }
-    return semanticAffinity[b] - semanticAffinity[a];
+    return poolCounts[a] - poolCounts[b];
   });
 
   const winningRoleId = roles[0]!;
@@ -273,18 +332,20 @@ function computeTeamMetrics(members: TeamMemberSnapshot[]): {
         )
       : 0;
 
-  const uniqueCohorts = new Set(
-    members.map((m) => `${m.schoolOrOrganization}::${m.gradeOrPosition}`)
-  ).size;
+  const uniqueSchools = new Set(members.map((m) => m.schoolOrOrganization)).size;
+  const uniqueGrades = new Set(members.map((m) => m.gradeOrPosition)).size;
   const V =
-    members.length > 0 && uniqueCohorts === members.length
+    members.length > 0 &&
+    uniqueSchools === members.length &&
+    uniqueGrades === members.length
       ? 100
-      : Math.round((uniqueCohorts / Math.max(1, members.length)) * 100);
+      : Math.round(
+          ((uniqueSchools + uniqueGrades) / Math.max(1, members.length * 2)) *
+            100
+        );
 
-  // Per `/plans/agent-roles.md`: TBI_j = (0.70 * avgTPS) + (0.15 * R) + (0.15 * V)
-  const teamBalanceIndex = Number(
-    (0.7 * avgTps + 0.15 * R + 0.15 * V).toFixed(1)
-  );
+  // Per Agent 2 Step 3: TBI = Arithmetic mean of the 4 team members' TPS scores
+  const teamBalanceIndex = avgTps;
 
   // Compatibility percentage (0-100)
   const compatibilityPercentage = Number(
@@ -357,25 +418,37 @@ async function executeEvaluationPipeline(
 
     await delay(250);
 
-    // Optional ADK call for live LLM trace
-    const promptForAgent1 = JSON.stringify(
-      questionnaires.map((q) => ({
+    // ADK call for Agent 1 (`student_profiling_agent`) with targetCohortSize and raw situational texts
+    const promptForAgent1 = JSON.stringify({
+      targetCohortSize,
+      candidates: questionnaires.map((q) => ({
         participantId: q.participantId,
+        questionnaireId: q.id,
         generalInfo: q.generalInfo,
         profileMetrics: q.profileMetrics,
-        roleAssessmentAnswers: q.roleAssessmentAnswers,
-      }))
-    );
+        situationalAnswers: extractSituationalAnswers(q),
+      })),
+    });
     void runAgentPrompt(studentProfilingAgent, promptForAgent1);
 
     // Step 1: Index calculation & 4H role resolution per participant
     const profiledParticipants: ParticipantDoc[] = [];
+    const questionnaireById = new Map<string, QuestionnaireDoc>(
+      questionnaires.map((q) => [q.participantId, q])
+    );
+    const runningRolePoolCounts: Record<Role4HId, number> = {
+      hacker: 0,
+      hipster: 0,
+      hustler: 0,
+      hound: 0,
+    };
 
     for (let i = 0; i < questionnaires.length; i++) {
       const q = questionnaires[i]!;
       await delay(90);
 
-      const roleProfile = computeParticipantRoleProfile(q);
+      const roleProfile = computeParticipantRoleProfile(q, runningRolePoolCounts);
+      runningRolePoolCounts[roleProfile.roleId] += 1;
       const baseParticipant: ParticipantDoc = participantMap.get(q.participantId) ?? {
         id: q.participantId,
         evaluationId,
@@ -403,7 +476,7 @@ async function executeEvaluationPipeline(
         {
           agentName: "student_profiling_agent",
           phase: "indexing",
-          message: `Профилиран ${updatedParticipant.fullName} (${updatedParticipant.schoolOrOrganization}, ${updatedParticipant.gradeOrPosition}) → AI:${roleProfile.indices.AI} | EI:${roleProfile.indices.EI} | INI:${roleProfile.indices.INI} | ENI:${roleProfile.indices.ENI} | MI:${roleProfile.indices.MI} ⇒ TPS: ${roleProfile.tps} | 4H Роля: ${roleProfile.roleName} (${roleProfile.roleVoteBreakdown[roleProfile.roleId]}/4 гласа)`,
+          message: `Профилиран ${updatedParticipant.fullName} (${updatedParticipant.schoolOrOrganization}, ${updatedParticipant.gradeOrPosition}) → AI:${roleProfile.indices.AI} | EI:${roleProfile.indices.EI} | MI:${roleProfile.indices.MI} | INI:${roleProfile.indices.INI} | ENI:${roleProfile.indices.ENI} ⇒ TPS: ${roleProfile.tps} | 4H Роля: ${roleProfile.roleName} (${roleProfile.roleVoteBreakdown[roleProfile.roleId]}/4 гласа)`,
           metadata: {
             participantIds: [updatedParticipant.id],
           },
@@ -431,20 +504,19 @@ async function executeEvaluationPipeline(
 
     await delay(250);
 
-    // Step 2: Descending sort by TPS with MI -> INI tie-breaking & Top-K cutoff
+    // Step 2: Descending sort by TPS with MI tie-breaker & Top-K cutoff per Agent 1 Step 3
     const sortedParticipants = [...profiledParticipants].sort((a, b) => {
       const tpsA = a.role?.tps ?? 0;
       const tpsB = b.role?.tps ?? 0;
       if (tpsB !== tpsA) return tpsB - tpsA;
       const miA = a.role?.indices.MI ?? 0;
       const miB = b.role?.indices.MI ?? 0;
-      if (miB !== miA) return miB - miA;
-      const iniA = a.role?.indices.INI ?? 0;
-      const iniB = b.role?.indices.INI ?? 0;
-      return iniB - iniA;
+      return miB - miA;
     });
 
     const rankedParticipants: ParticipantDoc[] = [];
+    const allCandidatesRanked: Agent1EvaluatedCandidate[] = [];
+
     for (let idx = 0; idx < sortedParticipants.length; idx++) {
       const p = sortedParticipants[idx]!;
       const rank = idx + 1;
@@ -455,7 +527,37 @@ async function executeEvaluationPipeline(
         isSelected,
       });
       rankedParticipants.push(saved);
+
+      const qDoc = questionnaireById.get(p.id);
+      if (p.role && qDoc) {
+        allCandidatesRanked.push({
+          participantId: p.id,
+          questionnaireId: p.questionnaireId,
+          fullName: p.fullName,
+          schoolOrOrganization: p.schoolOrOrganization,
+          gradeOrPosition: p.gradeOrPosition,
+          indices: {
+            AI: p.role.indices.AI,
+            EI: p.role.indices.EI,
+            MI: p.role.indices.MI,
+            INI: p.role.indices.INI,
+            ENI: p.role.indices.ENI,
+          },
+          tps: p.role.tps,
+          rank,
+          isSelected,
+          situationalAnswers: extractSituationalAnswers(qDoc),
+        });
+      }
     }
+
+    const agent1StructuredOutput: Agent1ProfilingOutput = {
+      targetCohortSize,
+      totalEvaluated: allCandidatesRanked.length,
+      selectedCount: allCandidatesRanked.filter((c) => c.isSelected).length,
+      selectedCandidates: allCandidatesRanked.filter((c) => c.isSelected),
+      allCandidatesRanked,
+    };
 
     const selectedCohort = rankedParticipants.filter((p) => p.isSelected && p.role !== null);
     const avgCohortTps =
@@ -473,7 +575,7 @@ async function executeEvaluationPipeline(
       {
         agentName: "student_profiling_agent",
         phase: "selection_cutoff",
-        message: `Класиране по TPS завършено (Tie-breaker: MI → INI). Селектирани ${selectedCohort.length} от ${rankedParticipants.length} кандидати (Top-${targetCohortSize}). Среден TPS на випуска: ${avgCohortTps} т.`,
+        message: `Класиране по TPS завършено (Tie-breaker: MI). Селектирани ${selectedCohort.length} от ${rankedParticipants.length} кандидати (Top-${targetCohortSize}). Среден TPS на випуска: ${avgCohortTps} т.`,
         metadata: {
           participantIds: selectedCohort.map((p) => p.id),
         },
@@ -494,7 +596,7 @@ async function executeEvaluationPipeline(
 
     await delay(300);
 
-    // Step 3: Agent 2 (`team_formation_agent`) 4H Role Distribution & Matrix Assembly
+    // Step 3: Agent 2 (`team_formation_agent`) receives Agent 1 JSON output (`selectedCandidates` + `situationalAnswers`)
     const roleCounts: Record<Role4HId, number> = {
       hacker: 0,
       hipster: 0,
@@ -516,21 +618,13 @@ async function executeEvaluationPipeline(
 
     void runAgentPrompt(
       teamFormationAgent,
-      JSON.stringify(
-        selectedCohort.map((p) => ({
-          id: p.id,
-          fullName: p.fullName,
-          schoolOrOrganization: p.schoolOrOrganization,
-          gradeOrPosition: p.gradeOrPosition,
-          role: p.role,
-        }))
-      )
+      JSON.stringify(agent1StructuredOutput.selectedCandidates)
     );
 
     await delay(250);
 
     // Build 4-person teams enforcing Constraint 1 (1 Hacker, 1 Hipster, 1 Hustler, 1 Hound)
-    // and Constraint 2 (distinct schoolOrOrganization/gradeOrPosition)
+    // and Constraint 2 (distinct schoolOrOrganization AND distinct gradeOrPosition when possible)
     const unassigned = [...selectedCohort];
     const roleOrder: Role4HId[] = ["hacker", "hipster", "hustler", "hound"];
     const assembledTeams: TeamDoc[] = [];
@@ -538,36 +632,51 @@ async function executeEvaluationPipeline(
 
     while (unassigned.length > 0) {
       const picked: ParticipantDoc[] = [];
-      const usedCohorts = new Set<string>();
+      const usedSchools = new Set<string>();
+      const usedGrades = new Set<string>();
 
       for (const targetRole of roleOrder) {
-        // Prefer candidate with matching role AND distinct school/grade cohort
+        // 1. Prefer candidate with matching role AND distinct school AND distinct grade
         let candidateIdx = unassigned.findIndex(
           (u) =>
             u.role?.roleId === targetRole &&
-            !usedCohorts.has(`${u.schoolOrOrganization}::${u.gradeOrPosition}`)
+            !usedSchools.has(u.schoolOrOrganization) &&
+            !usedGrades.has(u.gradeOrPosition)
         );
+        // 2. Fallback: matching role AND distinct school
+        if (candidateIdx === -1) {
+          candidateIdx = unassigned.findIndex(
+            (u) =>
+              u.role?.roleId === targetRole &&
+              !usedSchools.has(u.schoolOrOrganization)
+          );
+        }
+        // 3. Fallback: matching role (if mathematically unavoidable)
         if (candidateIdx === -1) {
           candidateIdx = unassigned.findIndex((u) => u.role?.roleId === targetRole);
         }
         if (candidateIdx !== -1) {
           const chosen = unassigned.splice(candidateIdx, 1)[0]!;
           picked.push(chosen);
-          usedCohorts.add(`${chosen.schoolOrOrganization}::${chosen.gradeOrPosition}`);
+          usedSchools.add(chosen.schoolOrOrganization);
+          usedGrades.add(chosen.gradeOrPosition);
         }
       }
 
       // Fill any remaining slots up to 4
       while (picked.length < 4 && unassigned.length > 0) {
         const nextIdx = unassigned.findIndex(
-          (u) => !usedCohorts.has(`${u.schoolOrOrganization}::${u.gradeOrPosition}`)
+          (u) =>
+            !usedSchools.has(u.schoolOrOrganization) &&
+            !usedGrades.has(u.gradeOrPosition)
         );
         const chosen =
           nextIdx !== -1
             ? unassigned.splice(nextIdx, 1)[0]!
             : unassigned.shift()!;
         picked.push(chosen);
-        usedCohorts.add(`${chosen.schoolOrOrganization}::${chosen.gradeOrPosition}`);
+        usedSchools.add(chosen.schoolOrOrganization);
+        usedGrades.add(chosen.gradeOrPosition);
       }
 
       const members: TeamMemberSnapshot[] = picked.map((p) => ({

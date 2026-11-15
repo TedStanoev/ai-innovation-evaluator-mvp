@@ -83,8 +83,9 @@ export const ROLE_4H_THEME: Record<
     scoreText: "text-sky-600",
     barColor: "bg-sky-500",
     strengthsList: [
-      "Логика и програмиране",
-      "Техническо изпълнение и прототипиране",
+      "Технологични решения",
+      "Логика",
+      "Изпълнение"
     ],
     Icon: Code2,
   },
@@ -96,8 +97,9 @@ export const ROLE_4H_THEME: Record<
     scoreText: "text-purple-600",
     barColor: "bg-purple-500",
     strengthsList: [
-      "UI/UX дизайн и визуална идентичност",
-      "Потребителско преживяване",
+      "Дизайн",
+      "Маркетинг",
+      "Потребителско преживяване"
     ],
     Icon: Paintbrush,
   },
@@ -109,8 +111,9 @@ export const ROLE_4H_THEME: Record<
     scoreText: "text-amber-600",
     barColor: "bg-amber-500",
     strengthsList: [
-      "Бизнес стратегия и продуктово лидерство",
-      "Пазарна валидация и комуникация",
+      "Бизнес модел",
+      "Продажби",
+      "Лидерство"
     ],
     Icon: Zap,
   },
@@ -122,8 +125,9 @@ export const ROLE_4H_THEME: Record<
     scoreText: "text-emerald-600",
     barColor: "bg-emerald-500",
     strengthsList: [
-      "Финансово структуриране и планиране",
-      "Управление на срокове и координация",
+      "Организация",
+      "Проучване",
+      "Логистика и осигуряване на ресурси"
     ],
     Icon: Lightbulb,
   },
@@ -289,7 +293,10 @@ const ROLE_Q4_OPTIONS: { role: Role4HId; text: string }[] = [
   },
 ];
 
-function computeClientRoleProfile(q: QuestionnaireDoc): ParticipantRoleProfile {
+function computeClientRoleProfile(
+  q: QuestionnaireDoc,
+  currentPoolRoleCounts?: Record<Role4HId, number>
+): ParticipantRoleProfile {
   const {
     gpa,
     extracurricularCount,
@@ -309,7 +316,9 @@ function computeClientRoleProfile(q: QuestionnaireDoc): ParticipantRoleProfile {
   const MI = (Math.max(1, Math.min(5, motivationScoreRaw)) - 1) * 25;
   const INI = (Math.max(1, Math.min(5, initiativeScoreRaw)) - 1) * 25;
   const ENI = (Math.max(1, Math.min(5, entrepreneurialScoreRaw)) - 1) * 25;
-  const tps = Number((0.2 * (AI + EI + INI + ENI + MI)).toFixed(1));
+  const tps = Number(
+    (0.2 * AI + 0.2 * EI + 0.2 * INI + 0.2 * ENI + 0.2 * MI).toFixed(1)
+  );
 
   const roleVoteBreakdown: Record<Role4HId, number> = {
     hacker: 0,
@@ -327,17 +336,18 @@ function computeClientRoleProfile(q: QuestionnaireDoc): ParticipantRoleProfile {
     roleVoteBreakdown[a] = (roleVoteBreakdown[a] || 0) + 1;
   }
 
-  const affinity: Record<Role4HId, number> = {
-    hacker: AI + EI,
-    hipster: MI + EI,
-    hustler: ENI + INI,
-    hound: INI + AI,
+  // Tie-breaker per Agent 2 Step 1: assign the role with the greatest shortage in the current candidate pool
+  const poolCounts: Record<Role4HId, number> = currentPoolRoleCounts ?? {
+    hacker: 0,
+    hipster: 0,
+    hustler: 0,
+    hound: 0,
   };
   const roles: Role4HId[] = ["hacker", "hipster", "hustler", "hound"];
   roles.sort((a, b) =>
     roleVoteBreakdown[b] !== roleVoteBreakdown[a]
       ? roleVoteBreakdown[b] - roleVoteBreakdown[a]
-      : affinity[b] - affinity[a]
+      : poolCounts[a] - poolCounts[b]
   );
   const winning = roles[0]!;
 
@@ -377,17 +387,20 @@ function recalculateTeamMetrics(members: TeamMemberSnapshot[]) {
         )
       : 0;
 
-  const uniqueCohorts = new Set(
-    members.map((m) => `${m.schoolOrOrganization}::${m.gradeOrPosition}`)
-  ).size;
+  const uniqueSchools = new Set(members.map((m) => m.schoolOrOrganization)).size;
+  const uniqueGrades = new Set(members.map((m) => m.gradeOrPosition)).size;
   const V =
-    members.length > 0 && uniqueCohorts === members.length
+    members.length > 0 &&
+    uniqueSchools === members.length &&
+    uniqueGrades === members.length
       ? 100
-      : Math.round((uniqueCohorts / Math.max(1, members.length)) * 100);
+      : Math.round(
+          ((uniqueSchools + uniqueGrades) / Math.max(1, members.length * 2)) *
+            100
+        );
 
-  const teamBalanceIndex = Number(
-    (0.7 * avgTps + 0.15 * R + 0.15 * V).toFixed(1)
-  );
+  // Per Agent 2 Step 3: TBI = Arithmetic mean of the 4 team members' TPS scores
+  const teamBalanceIndex = avgTps;
   const compatibilityPercentage = Number(
     (0.4 * R + 0.4 * avgTps + 0.2 * V).toFixed(1)
   );
@@ -426,9 +439,17 @@ function buildInitialMockData(evaluationId: string) {
     roleAssessmentAnswers: mq.roleAssessmentAnswers,
   }));
 
+  const runningRolePoolCounts: Record<Role4HId, number> = {
+    hacker: 0,
+    hipster: 0,
+    hustler: 0,
+    hound: 0,
+  };
+
   const pDocs: ParticipantDoc[] = qDocs.map((q, idx) => {
     const mq = mockQuestionnaires[idx]!;
-    const role = computeClientRoleProfile(q);
+    const role = computeClientRoleProfile(q, runningRolePoolCounts);
+    runningRolePoolCounts[role.roleId] += 1;
     return {
       id: q.participantId,
       evaluationId,
@@ -445,10 +466,15 @@ function buildInitialMockData(evaluationId: string) {
     };
   });
 
-  // Sort descending by TPS so Team 01 gets top 4H and Team 02 gets second 4H
-  const sorted = [...pDocs].sort(
-    (a, b) => (b.role?.tps ?? 0) - (a.role?.tps ?? 0)
-  );
+  // Sort descending by TPS with MI tie-breaker per Agent 1 specification
+  const sorted = [...pDocs].sort((a, b) => {
+    const tpsA = a.role?.tps ?? 0;
+    const tpsB = b.role?.tps ?? 0;
+    if (tpsB !== tpsA) return tpsB - tpsA;
+    const miA = a.role?.indices.MI ?? 0;
+    const miB = b.role?.indices.MI ?? 0;
+    return miB - miA;
+  });
   const unassigned = [...sorted];
   const roleOrder: Role4HId[] = ["hacker", "hipster", "hustler", "hound"];
   const builtTeams: TeamDoc[] = [];
@@ -743,6 +769,9 @@ export default function StudentTeamBuilderView({
       const tpsA = a.role?.tps ?? -1;
       const tpsB = b.role?.tps ?? -1;
       if (tpsB !== tpsA) return tpsB - tpsA;
+      const miA = a.role?.indices.MI ?? -1;
+      const miB = b.role?.indices.MI ?? -1;
+      if (miB !== miA) return miB - miA;
       return a.id.localeCompare(b.id);
     });
   }, [participants, searchQuery, sortBy, questionnaireByParticipantId]);
@@ -1810,8 +1839,8 @@ export default function StudentTeamBuilderView({
                             </div>
 
                             <span className="text-[11px] font-bold text-slate-500">
-                              TBI Формула: 70% Среден TPS + 15% 4H Покритие +
-                              15% Разнообразие
+                              TBI Формула: Средноаритметично от TPS на 4-мата
+                              членове ({team.averageTPS.toFixed(1)} т.)
                             </span>
                           </div>
 

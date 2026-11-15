@@ -1,3 +1,4 @@
+import { serverEnv } from "./env.js";
 import { QuestionnaireSubmissionInput } from "./types/schema.js";
 
 export const mockQuestionnaires: QuestionnaireSubmissionInput[] = [
@@ -203,7 +204,7 @@ export const mockQuestionnaires: QuestionnaireSubmissionInput[] = [
   },
 ];
 
-const API_URL = process.env.API_URL || "http://localhost:4000";
+const API_URL = serverEnv.API_URL;
 
 async function seedMockQuestionnaires() {
   console.log(`Posting ${mockQuestionnaires.length} mock questionnaires to ${API_URL}/api/questionnaires...`);

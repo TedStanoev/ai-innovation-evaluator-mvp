@@ -18,31 +18,22 @@ import {
   TeamDoc,
 } from "../types";
 import { fetchEvaluationSnapshot } from "./api";
+import { clientEnv, clientEnvValidation } from "./env";
 
-export const ENABLE_FIREBASE = import.meta.env.VITE_ENABLE_FIREBASE !== "false";
+export const ENABLE_FIREBASE = clientEnv.VITE_ENABLE_FIREBASE;
 
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "YOUR_FIREBASE_API_KEY_HERE",
-  authDomain:
-    import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "YOUR_FIREBASE_PROJECT_ID.firebaseapp.com",
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "YOUR_FIREBASE_PROJECT_ID",
-  storageBucket:
-    import.meta.env.VITE_FIREBASE_STORAGE_BUCKET ||
-    "YOUR_FIREBASE_PROJECT_ID.firebasestorage.app",
-  messagingSenderId:
-    import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "YOUR_FIREBASE_MESSAGING_SENDER_ID",
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || "YOUR_FIREBASE_APP_ID",
+  apiKey: clientEnv.VITE_FIREBASE_API_KEY,
+  authDomain: clientEnv.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: clientEnv.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: clientEnv.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: clientEnv.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: clientEnv.VITE_FIREBASE_APP_ID,
 };
 
 export function isFirebaseConfigured(): boolean {
-  if (!ENABLE_FIREBASE) return false;
-  const { apiKey, projectId } = firebaseConfig;
-  return (
-    Boolean(apiKey) &&
-    Boolean(projectId) &&
-    !apiKey.startsWith("YOUR_") &&
-    !projectId.startsWith("YOUR_")
-  );
+  if (!ENABLE_FIREBASE || !clientEnvValidation.isValid) return false;
+  return Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
 }
 
 let app: FirebaseApp | null = null;

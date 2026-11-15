@@ -34,25 +34,17 @@ import {
   QuestionnaireSubmissionInput,
   TeamDoc,
 } from "./types/schema.js";
+import { serverEnv } from "./env.js";
 
 export * from "./types/schema.js";
 
 export const DEFAULT_EVALUATION_ID = "student-cohort-2026";
 
-function isPlaceholder(val?: string): boolean {
-  if (!val) return true;
-  return (
-    val.startsWith("YOUR_") ||
-    val.startsWith("MY_") ||
-    val === "your_gemini_api_key_here"
-  );
-}
-
 let adminDb: AdminFirestore | null = null;
 let webDb: WebFirestore | null = null;
 let firestoreMode: "admin" | "web-sdk" | "memory" = "memory";
 
-const ENABLE_FIRESTORE = process.env.ENABLE_FIRESTORE !== "false";
+const ENABLE_FIRESTORE = serverEnv.ENABLE_FIRESTORE;
 
 export function initFirestore(): {
   adminDb: AdminFirestore | null;
@@ -68,20 +60,15 @@ export function initFirestore(): {
     return { adminDb, webDb, mode: firestoreMode };
   }
 
-  const projectId =
-    process.env.FIREBASE_PROJECT_ID ||
-    process.env.VITE_FIREBASE_PROJECT_ID ||
-    "team-evaluator-973eb";
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
-  const isCloudRun = Boolean(process.env.K_SERVICE);
-  const hasAdcFile = Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+  const projectId = serverEnv.FIREBASE_PROJECT_ID;
+  const clientEmail = serverEnv.FIREBASE_CLIENT_EMAIL;
+  const privateKey = serverEnv.FIREBASE_PRIVATE_KEY;
+  const isCloudRun = Boolean(serverEnv.K_SERVICE);
+  const hasAdcFile = Boolean(serverEnv.GOOGLE_APPLICATION_CREDENTIALS);
 
   // 1. Try Firebase Admin SDK if service account or ADC is configured
   if (
-    (!isPlaceholder(projectId) &&
-      !isPlaceholder(clientEmail) &&
-      !isPlaceholder(privateKey)) ||
+    Boolean(projectId && clientEmail && privateKey) ||
     isCloudRun ||
     hasAdcFile
   ) {
@@ -89,11 +76,7 @@ export function initFirestore(): {
       let app: AdminApp;
       if (getAdminApps().length > 0) {
         app = getAdminApps()[0]!;
-      } else if (
-        !isPlaceholder(projectId) &&
-        !isPlaceholder(clientEmail) &&
-        !isPlaceholder(privateKey)
-      ) {
+      } else if (projectId && clientEmail && privateKey) {
         app = initAdminApp({
           credential: cert({
             projectId,
@@ -102,7 +85,7 @@ export function initFirestore(): {
           }),
         });
       } else {
-        app = initAdminApp(projectId && !isPlaceholder(projectId) ? { projectId } : undefined);
+        app = initAdminApp(projectId ? { projectId } : undefined);
       }
       adminDb = getAdminFirestore(app);
       firestoreMode = "admin";
@@ -112,30 +95,15 @@ export function initFirestore(): {
     }
   }
 
-  // 2. Initialize Firebase Web SDK against Cloud Firestore (`team-evaluator-973eb`)
+  // 2. Initialize Firebase Web SDK against Cloud Firestore using .env configuration
   try {
     const firebaseWebConfig = {
-      apiKey:
-        process.env.FIREBASE_API_KEY ||
-        process.env.VITE_FIREBASE_API_KEY ||
-        "AIzaSyC6RLai6GY-hRp9kOvrggdO-nlgG5fVplE",
-      authDomain:
-        process.env.FIREBASE_AUTH_DOMAIN ||
-        process.env.VITE_FIREBASE_AUTH_DOMAIN ||
-        `${projectId}.firebaseapp.com`,
-      projectId,
-      storageBucket:
-        process.env.FIREBASE_STORAGE_BUCKET ||
-        process.env.VITE_FIREBASE_STORAGE_BUCKET ||
-        `${projectId}.firebasestorage.app`,
-      messagingSenderId:
-        process.env.FIREBASE_MESSAGING_SENDER_ID ||
-        process.env.VITE_FIREBASE_MESSAGING_SENDER_ID ||
-        "610694951262",
-      appId:
-        process.env.FIREBASE_APP_ID ||
-        process.env.VITE_FIREBASE_APP_ID ||
-        "1:610694951262:web:29ab381c17ce803b469fcf",
+      apiKey: serverEnv.FIREBASE_API_KEY,
+      authDomain: serverEnv.FIREBASE_AUTH_DOMAIN,
+      projectId: serverEnv.FIREBASE_PROJECT_ID,
+      storageBucket: serverEnv.FIREBASE_STORAGE_BUCKET,
+      messagingSenderId: serverEnv.FIREBASE_MESSAGING_SENDER_ID,
+      appId: serverEnv.FIREBASE_APP_ID,
     };
 
     const app: WebFirebaseApp =
@@ -161,7 +129,7 @@ export function getFirestoreStatus(): {
     enabled: mode !== "memory",
     mode: mode !== "memory" ? "firestore" : "memory",
     driver: mode,
-    projectId: process.env.FIREBASE_PROJECT_ID || "team-evaluator-973eb",
+    projectId: serverEnv.FIREBASE_PROJECT_ID,
   };
 }
 

@@ -65,27 +65,47 @@ $$TPS = (0.20 \times AI) + (0.20 \times EI) + (0.20 \times INI) + (0.20 \times E
 ### 2.3. Selection, Tie-Breaking & Cutoff Logic
 
 1. **Sorting:** All evaluated candidates are sorted in strict descending order by $TPS$.
-2. **Tie-Breaker Rule:** If two or more candidates have an identical $TPS$ ($TPS_a = TPS_b$), priority is awarded to the candidate with the higher Motivation Index ($MI_a > MI_b$). If $MI$ is also tied, secondary fallback uses $INI$.
-3. **Cohort Cutoff:** The sorted list is sliced to the target cohort size $K$ (default: $K = 96$, configurable per campaign). Candidates ranked $1 \dots K$ receive status `"selected"`; candidates $> K$ receive `"waitlisted"`.
+2. **Tie-Breaker Rule:** If two or more candidates have an identical $TPS$ ($TPS_a = TPS_b$), priority is awarded to the candidate with the higher Motivation Index ($MI_a > MI_b$).
+3. **Cohort Cutoff:** The sorted list is sliced to the target cohort size $K$ (default: $K = 96$, configurable per campaign). Candidates ranked $1 \dots K$ receive `isSelected: true` and are passed along with the raw text of their 4 situational work-style answers (`situationalAnswers`) to Agent 2 (`team_formation_agent`).
 
-### 2.4. Agent 1 Output Schema (`ProfilingResult`)
+### 2.4. Agent 1 Output Schema (`Agent1ProfilingOutput`)
 
 ```typescript
-export interface CandidateProfileScore {
-  candidateId: string;
+export interface SituationalAnswerItem {
+  roleTag: "hacker" | "hipster" | "hustler" | "hound";
+  rawText: string;
+}
+
+export interface Agent1EvaluatedCandidate {
+  participantId: string;
+  questionnaireId: string;
   fullName: string;
-  departmentOrClass: string; // Required by Agent 2 for diversity constraints
+  schoolOrOrganization: string;
+  gradeOrPosition: string;
   indices: {
-    AI: number;  // 0-100
-    EI: number;  // 0-100
-    INI: number; // 0-100
-    ENI: number; // 0-100
-    MI: number;  // 0-100
+    AI: number;  // ((GPA - 3) / 3) * 100
+    EI: number;  // 0->0, 1->25, 2->50, 3->75, >=4->100
+    MI: number;  // (Score - 1) * 25
+    INI: number; // (Score - 1) * 25
+    ENI: number; // (Score - 1) * 25
   };
-  tps: number; // Calculated deterministic weighted sum
-  rationale: string; // Concise audit trail for UI Thought Inspector
-  rank?: number;
-  selected?: boolean;
+  tps: number; // (0.20 * AI) + (0.20 * EI) + (0.20 * INI) + (0.20 * ENI) + (0.20 * MI)
+  rank: number;
+  isSelected: boolean;
+  situationalAnswers: {
+    q1_teamStrength: SituationalAnswerItem;
+    q2_deadlineFocus: SituationalAnswerItem;
+    q3_challengeType: SituationalAnswerItem;
+    q4_communicationStyle: SituationalAnswerItem;
+  };
+}
+
+export interface Agent1ProfilingOutput {
+  targetCohortSize: number;
+  totalEvaluated: number;
+  selectedCount: number;
+  selectedCandidates: Agent1EvaluatedCandidate[];
+  allCandidatesRanked: Agent1EvaluatedCandidate[];
 }
 ```
 
@@ -99,47 +119,40 @@ export interface CandidateProfileScore {
 
 ### 3.1. Micro-Role Classification (4H Framework)
 
-`gemini-3.8-flash` analyzes each selected participant's profile, experience, and index distribution to assign exactly one primary functional role from the **4H Framework**:
+`gemini-3.8-flash` analyzes each selected participant's 4 situational work-style answers (`q1_teamStrength`, `q2_deadlineFocus`, `q3_challengeType`, `q4_communicationStyle`) to assign exactly one primary functional role from the **4H Framework** based on the majority of their answers:
 
-* **`Hacker`**: Technical execution, software engineering, system logic, data architecture, and prototyping.
-* **`Hipster`**: UI/UX design, branding, marketing, user empathy, and product presentation.
-* **`Hustler`**: Business modeling, sales strategy, market validation, pitching, and team leadership.
-* **`Hound`**: Operations, deep research, logistics, compliance, and resource acquisition.
+* **`Hacker`**: Technical execution, building solutions, logic, programming, testing functionality, technical facts.
+* **`Hipster`**: UI/UX design, visual identity, user experience, aesthetics, metaphors, creativity.
+* **`Hustler`**: Sales, business strategy, negotiations, pitching, finding real clients, confident persuasion.
+* **`Hound`**: Process structuring, task planning, deadlines, final compliance checks, organizing systems.
 
-*(Note: To ensure feasible matrix assembly for $M = K / 4$ teams, the agent tracks role quotas of $M$ slots per role, utilizing secondary role affinities when borderline profiles exist.)*
+* **Role Tie-Breaker Rule:** If a candidate has an equal number of votes for two or more roles, assign the role that currently has the **greatest shortage (fewest assigned candidates)** in the overall candidate pool.
 
 ### 3.2. Team Matrix Assembly & Hard Constraints
 
-Given $K$ selected participants (e.g., $K = 96$), the agent assembles $M = K / 4$ teams (e.g., $24$ teams of $4$ members). Every team $T_j$ ($j \in \{1 \dots M\}$) must satisfy two **non-negotiable hard constraints**:
+Given $K$ selected participants (e.g., $K = 96$), the agent assembles $M = K / 4$ teams of $4$ members. Every team $T_j$ ($j \in \{1 \dots M\}$) must satisfy two **strict constraints**:
 
 1. **Constraint 1 — Complete 4H Role Coverage:**
    Every team must contain exactly one member of each functional role:
    $$|T_j \cap \text{Hacker}| = 1, \quad |T_j \cap \text{Hipster}| = 1, \quad |T_j \cap \text{Hustler}| = 1, \quad |T_j \cap \text{Hound}| = 1$$
 
-2. **Constraint 2 — Institutional Diversity Constraint:**
-   No two members on the same team may belong to the same academic class, cohort, or department ($D$):
-   $$\forall u, v \in T_j \text{ where } u \neq v \implies D(u) \neq D(v)$$
+2. **Constraint 2 — Institutional & Class Diversity Constraint:**
+   No two members on the same team may belong to the same school/organization (`schoolOrOrganization`) or the same academic class (`gradeOrPosition`), unless mathematically unavoidable.
 
 ### 3.3. Team Balance Index ($TBI$) Monitoring & Automated Rebalancing
 
-To prevent "super-teams" from gaining an unfair competitive advantage, Agent 2 computes the **Team Balance Index ($TBI_j \in [0, 100]$)** for each team $T_j$, combining:
-* Mean team potential: $\overline{TPS}_j = \frac{1}{4} \sum_{u \in T_j} TPS(u)$
-* Role coverage validity score ($R_j = 100$ when all 4H roles are satisfied)
-* Department diversity score ($V_j = 100$ when all 4 departments are distinct)
+To guarantee competitive fairness across teams, Agent 2 computes the **Team Balance Index ($TBI_j \in [0, 100]$)** for each team $T_j$ as the **arithmetic mean of the 4 team members' TPS scores**:
 
-$$TBI_j = (0.70 \times \overline{TPS}_j) + (0.15 \times R_j) + (0.15 \times V_j)$$
+$$TBI_j = \overline{TPS}_j = \frac{1}{4} \sum_{u \in T_j} TPS(u)$$
 
 #### Self-Healing Rebalancing Algorithm (Swap Loop)
 
 1. Identify the highest-scoring team $T_{max} = \arg\max_j (TBI_j)$ and lowest-scoring team $T_{min} = \arg\min_j (TBI_j)$.
 2. Compute the imbalance spread:
    $$\Delta TBI = TBI_{max} - TBI_{min}$$
-3. **Trigger Condition:** While $\Delta TBI > 15.0$ (up to a deterministic safety cap of `maxIterations = 100`):
-   * Find a pair of participants $(u \in T_{max}, v \in T_{min})$ such that:
-     * **Identical Role:** $\text{Role}(u) = \text{Role}(v)$
-     * **Positive Potential Transfer:** $TPS(u) > TPS(v)$
-     * **Diversity Preservation:** Swapping $u$ and $v$ does not violate Constraint 2 ($D(u) \notin D(T_{min} \setminus \{v\})$ and $D(v) \notin D(T_{max} \setminus \{u\})$).
-   * Execute the swap ($T_{max} \leftrightarrow T_{min}$), log the rebalancing action to the Firestore `thoughtLogs` stream, and recalculate $TBI$ across all teams.
+3. **Trigger Condition:** While $\Delta TBI > 15.0$:
+   * Swap one member $u \in T_{max}$ with a member $v \in T_{min}$ who holds the **exact same 4H role** ($\text{Role}(u) = \text{Role}(v)$ and $TPS(u) > TPS(v)$) to equalize their average $TBI$ values while respecting the diversity constraint whenever possible.
+4. Repeat the automated audit and swaps until the maximum difference between any two teams is $\le 15.0$ points (or the smallest mathematically achievable difference is reached).
 
 ### 3.4. Agent 2 Output Schema (`TeamFormationResult`)
 
