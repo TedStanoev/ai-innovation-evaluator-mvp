@@ -3,8 +3,8 @@ FROM node:20-alpine AS builder
 RUN corepack enable
 WORKDIR /app
 COPY package.json pnpm-lock.yaml tsconfig.json ./
-RUN pnpm install --frozen-lockfile
 RUN pnpm approve-builds
+RUN pnpm install --frozen-lockfile
 COPY src ./src
 RUN pnpm run build
 
